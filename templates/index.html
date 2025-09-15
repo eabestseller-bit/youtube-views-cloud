@@ -15,7 +15,7 @@
 <body>
   <main class="container">
     <h1>Social Views Checker (YouTube + OK.ru + RuTube)</h1>
-    <p>Вставьте ссылки (по одной в строке). Поддерживается YouTube, OK.ru, RuTube.</p>
+    <p>Вставьте ссылки (по одной в строке). Поддерживаются YouTube, OK.ru, RuTube, Dzen.</p>
 
     {% if error %}
       <div class="error">Ошибка: {{ error }}</div>
@@ -24,9 +24,9 @@
     <form method="post">
       <label for="links">Ссылки:</label>
       <textarea id="links" name="links" placeholder="https://youtu.be/g_Y_dNkMLFM
-        https://ok.ru/video/1234567890123
-        https://rutube.ru/video/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/
-        https://dzen.ru/video/watch/XXXXXXXXXXXXXXX">{{ links }}</textarea>
+https://ok.ru/video/1234567890123
+https://rutube.ru/video/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/
+https://dzen.ru/video/watch/XXXXXXXXXXXX">{{ links }}</textarea>
       <button type="submit">Показать просмотры</button>
     </form>
 
@@ -44,6 +44,7 @@
       {% endfor %}
       </tbody>
     </table>
+
     <form method="post" action="/download">
       <input type="hidden" name="links" value="{{ links | e }}">
       <button type="submit">Скачать CSV</button>

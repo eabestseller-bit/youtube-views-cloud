@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cloud app: YouTube + OK.ru + RuTube + Dzen views
+Cloud app: YouTube + OK.ru + RuTube + Dzen
 - YouTube: через API (env YOUTUBE_API_KEY)
-- OK/RuTube/Dzen: best-effort парсинг HTML/JSON-LD
+- OK/RuTube/Dzen: best-effort парсинг HTML/JSON (без ключей)
 """
 
-import os, re, csv, io
+import os, re, csv, io, json
 from datetime import date
+from urllib.parse import urlsplit, urlunsplit
+
 from flask import Flask, render_template, request, send_file
 import requests
 from bs4 import BeautifulSoup
@@ -28,6 +30,14 @@ YT_PATTERNS = [
     r"(?:https?://)?(?:m\.)?youtube\.com/watch\?v=([A-Za-z0-9_\-]{6,})",
     r"(?:https?://)?(?:www\.)?youtube\.com/shorts/([A-Za-z0-9_\-]{6,})",
 ]
+
+def normalize_url(u: str) -> str:
+    # обрезаем query/fragment, чтобы не мешали (?share_to=...)
+    try:
+        sp = urlsplit(u.strip())
+        return urlunsplit((sp.scheme, sp.netloc, sp.path, "", ""))
+    except Exception:
+        return u.strip()
 
 def detect_platform(url: str) -> str:
     u = url.lower()
@@ -63,21 +73,23 @@ def extract_views_jsonld(html: str):
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all("script", {"type": "application/ld+json"}):
         try:
-            import json
             data = json.loads(tag.string or "")
         except Exception:
             continue
         items = data if isinstance(data, list) else [data]
         for obj in items:
             stats = obj.get("interactionStatistic") or obj.get("interactionStatistics")
-            if not stats: continue
+            if not stats: 
+                continue
             stats = stats if isinstance(stats, list) else [stats]
             for st in stats:
                 it = st.get("interactionType")
-                if isinstance(it, dict): it = it.get("@type")
+                if isinstance(it, dict):
+                    it = it.get("@type")
                 if (isinstance(it, str) and "WatchAction" in it) or st.get("@type") == "InteractionCounter":
                     v = parse_int(st.get("userInteractionCount"))
-                    if v is not None: return v
+                    if v is not None:
+                        return v
     return None
 
 def extract_views_generic(html: str):
@@ -92,17 +104,13 @@ def extract_views_generic(html: str):
 # ---------- platform fetchers
 
 def fetch_views_ok(url: str):
-    """
-    OK.ru: сначала обычная страница, затем мобильная m.ok.ru, + доп. паттерны.
-    """
+    """OK.ru: обычная страница → мобильная m.ok.ru → доп. паттерны."""
     try:
         html = http_get(url)
         v = extract_views_jsonld(html) or extract_views_generic(html)
         if v is not None: return v
     except Exception:
         pass
-
-    # пробуем мобильную версию
     try:
         m_url = url if "://m.ok.ru/" in url else url.replace("://ok.ru/", "://m.ok.ru/")
         html = http_get(m_url)
@@ -116,7 +124,6 @@ def fetch_views_ok(url: str):
         if m: return parse_int(m.group(1))
     except Exception:
         pass
-
     return None
 
 def fetch_views_rutube(url: str):
@@ -128,23 +135,77 @@ def fetch_views_rutube(url: str):
 
 def fetch_views_dzen(url: str):
     """
-    Dzen: JSON-LD + частые поля + русские подписи.
+    Dzen: JSON-LD → скан всех <script> с JSON → текстовые паттерны.
     """
     try:
         html = http_get(url)
         v = extract_views_jsonld(html)
-        if v is not None: return v
+        if v is not None: 
+            return v
 
-        for pattern in [
-            r'"views"\s*:\s*"?([\d\s\u00A0,\.]+)"?',
-            r'"viewCount"\s*:\s*"?([\d\s\u00A0,\.]+)"?',
-            r'"watchCount"\s*:\s*"?([\d\s\u00A0,\.]+)"?',
-        ]:
-            m = re.search(pattern, html)
-            if m: return parse_int(m.group(1))
+        soup = BeautifulSoup(html, "html.parser")
+
+        def pick_from_obj(obj):
+            # a) viewCounter.count
+            try:
+                val = obj
+                for key in ("viewCounter", "count"):
+                    val = val[key]
+                pv = parse_int(val)
+                if pv is not None: return pv
+            except Exception:
+                pass
+            # b) простые ключи
+            for k in ("viewsCount", "viewCount", "views", "watchCount"):
+                pv = parse_int(obj.get(k)) if isinstance(obj, dict) else None
+                if pv is not None: return pv
+            # c) вложенные варианты
+            for k1 in ("statistics", "stats", "meta", "counters"):
+                inner = obj.get(k1) if isinstance(obj, dict) else None
+                if isinstance(inner, dict):
+                    for k2 in ("views", "viewCount", "viewsCount", "watchCount"):
+                        pv = parse_int(inner.get(k2))
+                        if pv is not None: return pv
+            return None
+
+        for s in soup.find_all("script"):
+            txt = (s.string or s.text or "").strip()
+            if not txt:
+                continue
+            cand = None
+            try:
+                cand = json.loads(txt)
+            except Exception:
+                m = re.search(r"(\{.*\}|\[.*\])", txt, re.DOTALL)
+                if m:
+                    try:
+                        cand = json.loads(m.group(1))
+                    except Exception:
+                        cand = None
+            if cand is None:
+                continue
+            queue, seen = [cand], set()
+            while queue:
+                cur = queue.pop(0)
+                if id(cur) in seen: 
+                    continue
+                seen.add(id(cur))
+                if isinstance(cur, dict):
+                    pv = pick_from_obj(cur)
+                    if pv is not None: 
+                        return pv
+                    for v2 in cur.values():
+                        if isinstance(v2, (dict, list)):
+                            queue.append(v2)
+                elif isinstance(cur, list):
+                    for v2 in cur:
+                        if isinstance(v2, (dict, list)):
+                            queue.append(v2)
 
         m = re.search(r'(?:Просмотров|просмотров|ПРОСМОТРОВ)[^\d]{0,10}([\d\s\u00A0,\.]+)', html)
-        if m: return parse_int(m.group(1))
+        if m: 
+            return parse_int(m.group(1))
+
     except Exception:
         pass
     return None
@@ -184,30 +245,25 @@ def index():
     if request.method == "POST":
         try:
             links = request.form.get("links", "")
-            urls = [u.strip() for u in links.splitlines() if u.strip()]
+            urls = [normalize_url(u) for u in links.splitlines() if u.strip()]
             by_platform = {"youtube": [], "ok": [], "rutube": [], "dzen": [], "unknown": []}
             for u in urls:
                 by_platform[detect_platform(u)].append(u)
 
             rows = []
-            # YouTube
             if by_platform["youtube"]:
                 yt_map = fetch_views_youtube(by_platform["youtube"])
                 for u in by_platform["youtube"]:
                     rows.append((u, "YouTube", yt_map.get(u, "") or ""))
-            # OK
             for u in by_platform["ok"]:
                 v = fetch_views_ok(u)
                 rows.append((u, "OK.ru", v if v is not None else ""))
-            # RuTube
             for u in by_platform["rutube"]:
                 v = fetch_views_rutube(u)
                 rows.append((u, "RuTube", v if v is not None else ""))
-            # Dzen
             for u in by_platform["dzen"]:
                 v = fetch_views_dzen(u)
                 rows.append((u, "Dzen", v if v is not None else ""))
-            # Unknown
             for u in by_platform["unknown"]:
                 rows.append((u, "Unknown", ""))
 
@@ -219,7 +275,7 @@ def index():
 @app.route("/download", methods=["POST"])
 def download():
     links = request.form.get("links", "")
-    urls = [u.strip() for u in links.splitlines() if u.strip()]
+    urls = [normalize_url(u) for u in links.splitlines() if u.strip()]
     output = io.StringIO()
     w = csv.writer(output)
     w.writerow(["url", "platform", "views"])

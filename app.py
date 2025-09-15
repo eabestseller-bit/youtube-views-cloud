@@ -29,7 +29,9 @@ def detect_platform(url: str) -> str:
     if "youtu" in u: return "youtube"
     if "ok.ru" in u or "odnoklassniki" in u: return "ok"
     if "rutube.ru" in u: return "rutube"
+    if "dzen.ru" in u or "zen.yandex" in u: return "dzen"
     return "unknown"
+
 
 def yt_extract_id(token: str):
     token = token.strip()
@@ -138,6 +140,40 @@ def fetch_views_rutube(url: str):
     except Exception:
         return None
 
+def fetch_views_dzen(url: str):
+    """
+    Яндекс Дзен: пробуем вытащить число просмотров из HTML.
+    1) JSON-LD (interactionStatistic/WatchAction)
+    2) Популярные поля (views, viewCount, watchCount)
+    3) Русский текст "Просмотров 12 345"
+    """
+    try:
+        html = http_get(url)
+        v = extract_views_jsonld(html)
+        if v is not None:
+            return v
+
+        # Частые JSON-поля
+        import re as _re
+        for pattern in [
+            r'"views"\s*:\s*"?([\d\s\u00A0,\.]+)"?',
+            r'"viewCount"\s*:\s*"?([\d\s\u00A0,\.]+)"?',
+            r'"watchCount"\s*:\s*"?([\d\s\u00A0,\.]+)"?',
+        ]:
+            m = _re.search(pattern, html)
+            if m:
+                return parse_int(m.group(1))
+
+        # Текстовые варианты
+        m = _re.search(r'(?:Просмотров|просмотров|ПРОСМОТРОВ)[^\d]{0,10}([\d\s\u00A0,\.]+)', html)
+        if m:
+            return parse_int(m.group(1))
+
+    except Exception:
+        pass
+    return None
+
+
 def fetch_views_youtube(urls: list[str]):
     # batch by ids
     ids, id_by_url = [], {}
@@ -191,6 +227,10 @@ def index():
             for u in by_platform["rutube"]:
                 v = fetch_views_rutube(u)
                 rows.append((u, "RuTube", v if v is not None else ""))
+            # Dzen
+            for u in by_platform["dzen"]:
+                v = fetch_views_dzen(u)
+                rows.append((u, "Dzen", v if v is not None else ""))
             # Unknown
             for u in by_platform["unknown"]:
                 rows.append((u, "Unknown", ""))
@@ -208,7 +248,7 @@ def download():
     w = csv.writer(output)
     w.writerow(["url","platform","views"])
     # reuse same logic for consistency
-    by_platform = {"youtube":[], "ok":[], "rutube":[], "unknown":[]}
+    by_platform = {"youtube":[], "ok":[], "rutube":[], "dzen":[], "unknown":[]}
     for u in urls:
         by_platform[detect_platform(u)].append(u)
     yt_map = fetch_views_youtube(by_platform["youtube"]) if by_platform["youtube"] else {}
@@ -221,6 +261,8 @@ def download():
             w.writerow([u,"OK.ru", fetch_views_ok(u) or ""])
         elif p=="rutube":
             w.writerow([u,"RuTube", fetch_views_rutube(u) or ""])
+        elif p=="dzen":
+            w.writerow([u, "Dzen", fetch_views_dzen(u) or ""])
         else:
             w.writerow([u,"Unknown",""])
     output.seek(0)

@@ -4,7 +4,7 @@
 Cloud app: YouTube + OK.ru + RuTube + Dzen
 - YouTube: через API (env YOUTUBE_API_KEY)
 - OK/RuTube: парсинг HTML/JSON-LD
-- Dzen: рендер через Playwright (Chromium), чтобы увидеть счётчик на видео
+- Dzen: рендер через Playwright (Chromium) с несколькими попытками
 """
 
 import os, re, csv, io, json
@@ -19,9 +19,10 @@ from bs4 import BeautifulSoup
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/videos"
 UA = {
-    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/124.0 Safari/537.36")
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
 }
 
 # --------- утилиты
@@ -72,7 +73,7 @@ def parse_int(s):
     return None
 
 def extract_views_jsonld(html: str):
-    """Пытаемся найти interactionStatistic→WatchAction→userInteractionCount."""
+    """Ищем interactionStatistic→WatchAction→userInteractionCount в JSON-LD."""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all("script", {"type": "application/ld+json"}):
         try:
@@ -161,16 +162,17 @@ def fetch_views_youtube(urls):
                 out[u] = stats.get(vid)
     return out
 
-# --------- Dzen через Playwright (браузер)
+# --------- Dzen через Playwright (с несколькими попытками)
 
 def fetch_views_dzen(url: str):
     """
     Открываем страницу в Chromium (headless), ждём рендера,
-    кликаем по видео при необходимости, ищем число в текстах и глобальном стейте.
+    пробуем: JSON-LD → текстовые узлы с 'просмотр' → глобальные объекты → общий HTML.
+    Делаем до 3 попыток, «пинаем» видео кликом между попытками.
     """
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-    def pick_number(texts):
+    def pick_number_from_texts(texts):
         import re as _re
         for t in texts or []:
             m = _re.search(r'([\d\s\u00A0.,]+)', t)
@@ -189,110 +191,126 @@ def fetch_views_dzen(url: str):
                 viewport={"width": 1366, "height": 768},
             )
             page = context.new_page()
-            page.set_default_timeout(20000)
+            page.set_default_timeout(25000)
 
-            page.goto(url, wait_until="networkidle")
-            page.wait_for_timeout(1200)
+            for attempt in range(3):
+                page.goto(url, wait_until="domcontentloaded")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=7000)
+                except PWTimeout:
+                    pass
 
-            # 1) сначала попробуем JSON-LD из уже отрисованного HTML
-            html = page.content()
-            v = extract_views_jsonld(html)
-            if v is not None:
-                browser.close()
-                return v
-
-            # 2) «пнуть» плеер — иногда после клика появляется оверлей со счетчиком
-            try:
-                page.click("video", timeout=2000)
-                page.wait_for_timeout(800)
-            except Exception:
-                pass
-
-            # 2a) собрать текстовые узлы, содержащие «просмотр»
-            texts = page.evaluate("""
-                () => {
-                  const out = [];
-                  const walker = document.createTreeWalker(
-                    document.body, NodeFilter.SHOW_TEXT
-                  );
-                  let n;
-                  while ((n = walker.nextNode())) {
-                    const t = (n.textContent || "").trim();
-                    if (!t) continue;
-                    if (/[Пп]росмотр/.test(t) && /\\d/.test(t)) out.push(t);
-                  }
-                  return out.slice(0, 80);
-                }
-            """)
-            v = pick_number(texts)
-            if v is not None:
-                browser.close()
-                return v
-
-            # 3) посмотреть глобальные объекты состояния (если есть)
-            try:
-                data_candidates = page.evaluate("""
-                  () => {
-                    const out = [];
-                    try { if (window.__INITIAL_STATE__) out.push(window.__INITIAL_STATE__); } catch(e){}
-                    try { if (window.__DATA__) out.push(window.__DATA__); } catch(e){}
-                    try { if (window.__ZEN__) out.push(window.__ZEN__); } catch(e){}
-                    return out;
-                  }
-                """)
-                from collections import deque
-                def from_obj(obj):
-                    for k in ("views", "viewCount", "viewsCount", "watchCount"):
-                        try:
-                            pv = parse_int(obj.get(k))
-                            if pv is not None: return pv
-                        except Exception:
-                            pass
-                    for k1 in ("stats", "statistics", "meta", "counters", "analytics"):
-                        try:
-                            inner = obj.get(k1)
-                            if isinstance(inner, dict):
-                                for k2 in ("views", "viewCount", "viewsCount", "watchCount"):
-                                    pv = parse_int(inner.get(k2))
-                                    if pv is not None: return pv
-                        except Exception:
-                            pass
+                # попробуем дождаться появления любого текста с «просмотр»
+                had_selector = False
+                for sel in ["text=/просмотр/i", "text=/просмотров/i", "text=/Просмотр/i", "text=/Просмотров/i"]:
                     try:
-                        vc = obj.get("viewCounter")
-                        if isinstance(vc, dict):
-                            pv = parse_int(vc.get("count"))
-                            if pv is not None: return pv
-                    except Exception:
-                        pass
-                    return None
+                        page.wait_for_selector(sel, timeout=5000)
+                        had_selector = True
+                        break
+                    except PWTimeout:
+                        continue
 
-                for root in data_candidates or []:
-                    dq, seen = deque([root]), set()
-                    while dq:
-                        cur = dq.popleft()
-                        if id(cur) in seen: 
-                            continue
-                        seen.add(id(cur))
-                        if isinstance(cur, dict):
-                            pv = from_obj(cur)
-                            if pv is not None:
-                                browser.close()
-                                return pv
-                            for v2 in cur.values():
-                                if isinstance(v2, (dict, list)):
-                                    dq.append(v2)
-                        elif isinstance(cur, list):
-                            for v2 in cur:
-                                if isinstance(v2, (dict, list)):
-                                    dq.append(v2)
-            except Exception:
-                pass
+                html = page.content()
 
-            # 4) резерв — общий поиск по HTML
-            html = page.content()
-            v = extract_views_generic(html)
+                # 1) JSON-LD
+                v = extract_views_jsonld(html)
+                if v is not None:
+                    browser.close()
+                    return v
+
+                # 2) текстовые узлы
+                texts = page.evaluate("""
+                    () => {
+                      const out = [];
+                      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                      let n;
+                      while ((n = walker.nextNode())) {
+                        const t = (n.textContent || "").trim();
+                        if (!t) continue;
+                        if (/[Пп]росмотр/.test(t) && /\\d/.test(t)) out.push(t);
+                      }
+                      return out.slice(0, 120);
+                    }
+                """)
+                v = pick_number_from_texts(texts)
+                if v is not None:
+                    browser.close()
+                    return v
+
+                # 3) глобальные объекты
+                try:
+                    data_candidates = page.evaluate("""
+                      () => {
+                        const out = [];
+                        try { if (window.__INITIAL_STATE__) out.push(window.__INITIAL_STATE__); } catch(e){}
+                        try { if (window.__DATA__) out.push(window.__DATA__); } catch(e){}
+                        try { if (window.__ZEN__) out.push(window.__ZEN__); } catch(e){}
+                        return out;
+                      }
+                    """)
+                    from collections import deque
+                    def from_obj(obj):
+                        for k in ("views", "viewCount", "viewsCount", "watchCount"):
+                            try:
+                                pv = parse_int(obj.get(k))
+                                if pv is not None: return pv
+                            except Exception:
+                                pass
+                        for k1 in ("stats", "statistics", "meta", "counters", "analytics"):
+                            try:
+                                inner = obj.get(k1)
+                                if isinstance(inner, dict):
+                                    for k2 in ("views", "viewCount", "viewsCount", "watchCount"):
+                                        pv = parse_int(inner.get(k2))
+                                        if pv is not None: return pv
+                            except Exception:
+                                pass
+                        try:
+                            vc = obj.get("viewCounter")
+                            if isinstance(vc, dict):
+                                pv = parse_int(vc.get("count"))
+                                if pv is not None: return pv
+                        except Exception:
+                            pass
+                        return None
+
+                    for root in data_candidates or []:
+                        dq, seen = deque([root]), set()
+                        while dq:
+                            cur = dq.popleft()
+                            if id(cur) in seen: 
+                                continue
+                            seen.add(id(cur))
+                            if isinstance(cur, dict):
+                                pv = from_obj(cur)
+                                if pv is not None:
+                                    browser.close()
+                                    return pv
+                                for v2 in cur.values():
+                                    if isinstance(v2, (dict, list)):
+                                        dq.append(v2)
+                            elif isinstance(cur, list):
+                                for v2 in cur:
+                                    if isinstance(v2, (dict, list)):
+                                        dq.append(v2)
+                except Exception:
+                    pass
+
+                # 4) общий HTML
+                v = extract_views_generic(html)
+                if v is not None:
+                    browser.close()
+                    return v
+
+                # «пнуть» плеер и повторить
+                try:
+                    page.click("video", timeout=1500)
+                except Exception:
+                    pass
+                page.wait_for_timeout(800)
+
             browser.close()
-            return v
+            return None
     except Exception:
         return None
 

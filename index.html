@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>YouTube Views Checker</title>
+  <link rel="stylesheet" href="https://unpkg.com/mvp.css">
+  <style>
+    textarea { width: 100%; min-height: 180px; }
+    .container { max-width: 900px; margin: 0 auto; }
+    table { width: 100%; }
+    .error { background: #ffe9e9; padding: 10px 14px; border-radius: 8px; color: #900; }
+    footer { margin-top: 40px; font-size: 14px; color: #777; text-align: center; }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <h1>YouTube Views Checker</h1>
+    <p>Вставьте ссылки на YouTube (по одной в строке) и нажмите «Показать просмотры». Можно потом скачать CSV.</p>
+
+    {% if error %}
+      <div class="error">Ошибка: {{ error }}</div>
+    {% endif %}
+
+    <form method="post">
+      <label for="links">Ссылки:</label>
+      <textarea id="links" name="links" placeholder="https://youtu.be/g_Y_dNkMLFM
+https://www.youtube.com/watch?v=dQw4w9WgXcQ">{{ links }}</textarea>
+      <button type="submit">Показать просмотры</button>
+    </form>
+
+    {% if rows %}
+    <h2>Результат на {{ today }}</h2>
+    <table>
+      <thead><tr><th>URL</th><th>Просмотры</th></tr></thead>
+      <tbody>
+      {% for row in rows %}
+        <tr><td style="word-break: break-all">{{ row[0] }}</td><td>{{ row[1] }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <form method="post" action="/download">
+      <input type="hidden" name="links" value="{{ links | e }}">
+      <button type="submit">Скачать CSV</button>
+    </form>
+    {% endif %}
+
+    <footer>© YouTube Views Checker</footer>
+  </main>
+</body>
+</html>

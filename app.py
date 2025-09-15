@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cloud app: YouTube + OK.ru + RuTube + Dzen
+Cloud app: YouTube + OK.ru + RuTube + Dzen (надёжный Dzen через Playwright)
 - YouTube: через API (env YOUTUBE_API_KEY)
-- OK/RuTube/Dzen: best-effort парсинг HTML/JSON (без ключей)
+- OK/RuTube: парсинг HTML/JSON-LD
+- Dzen: загрузка страницы браузером (Playwright) + парсинг отрендеренного HTML
 """
 
 import os, re, csv, io, json
@@ -14,6 +15,7 @@ from flask import Flask, render_template, request, send_file
 import requests
 from bs4 import BeautifulSoup
 
+# ---------- конфиг
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/videos"
 UA = {
@@ -32,10 +34,9 @@ YT_PATTERNS = [
 ]
 
 def normalize_url(u: str) -> str:
-    # обрезаем query/fragment, чтобы не мешали (?share_to=...)
     try:
         sp = urlsplit(u.strip())
-        return urlunsplit((sp.scheme, sp.netloc, sp.path, "", ""))
+        return urlunsplit((sp.scheme, sp.netloc, sp.path, "", ""))  # убираем query/fragment
     except Exception:
         return u.strip()
 
@@ -101,10 +102,9 @@ def extract_views_generic(html: str):
     if m: return parse_int(m.group(1))
     return None
 
-# ---------- platform fetchers
+# ---------- парсеры площадок (YT/OK/RuTube как раньше)
 
 def fetch_views_ok(url: str):
-    """OK.ru: обычная страница → мобильная m.ok.ru → доп. паттерны."""
     try:
         html = http_get(url)
         v = extract_views_jsonld(html) or extract_views_generic(html)
@@ -133,83 +133,6 @@ def fetch_views_rutube(url: str):
     except Exception:
         return None
 
-def fetch_views_dzen(url: str):
-    """
-    Dzen: JSON-LD → скан всех <script> с JSON → текстовые паттерны.
-    """
-    try:
-        html = http_get(url)
-        v = extract_views_jsonld(html)
-        if v is not None: 
-            return v
-
-        soup = BeautifulSoup(html, "html.parser")
-
-        def pick_from_obj(obj):
-            # a) viewCounter.count
-            try:
-                val = obj
-                for key in ("viewCounter", "count"):
-                    val = val[key]
-                pv = parse_int(val)
-                if pv is not None: return pv
-            except Exception:
-                pass
-            # b) простые ключи
-            for k in ("viewsCount", "viewCount", "views", "watchCount"):
-                pv = parse_int(obj.get(k)) if isinstance(obj, dict) else None
-                if pv is not None: return pv
-            # c) вложенные варианты
-            for k1 in ("statistics", "stats", "meta", "counters"):
-                inner = obj.get(k1) if isinstance(obj, dict) else None
-                if isinstance(inner, dict):
-                    for k2 in ("views", "viewCount", "viewsCount", "watchCount"):
-                        pv = parse_int(inner.get(k2))
-                        if pv is not None: return pv
-            return None
-
-        for s in soup.find_all("script"):
-            txt = (s.string or s.text or "").strip()
-            if not txt:
-                continue
-            cand = None
-            try:
-                cand = json.loads(txt)
-            except Exception:
-                m = re.search(r"(\{.*\}|\[.*\])", txt, re.DOTALL)
-                if m:
-                    try:
-                        cand = json.loads(m.group(1))
-                    except Exception:
-                        cand = None
-            if cand is None:
-                continue
-            queue, seen = [cand], set()
-            while queue:
-                cur = queue.pop(0)
-                if id(cur) in seen: 
-                    continue
-                seen.add(id(cur))
-                if isinstance(cur, dict):
-                    pv = pick_from_obj(cur)
-                    if pv is not None: 
-                        return pv
-                    for v2 in cur.values():
-                        if isinstance(v2, (dict, list)):
-                            queue.append(v2)
-                elif isinstance(cur, list):
-                    for v2 in cur:
-                        if isinstance(v2, (dict, list)):
-                            queue.append(v2)
-
-        m = re.search(r'(?:Просмотров|просмотров|ПРОСМОТРОВ)[^\d]{0,10}([\d\s\u00A0,\.]+)', html)
-        if m: 
-            return parse_int(m.group(1))
-
-    except Exception:
-        pass
-    return None
-
 def fetch_views_youtube(urls):
     ids, id_by_url = [], {}
     for u in urls:
@@ -232,6 +155,51 @@ def fetch_views_youtube(urls):
             if vid in batch:
                 out[u] = stats.get(vid)
     return out
+
+# ---------- Dzen через Playwright (браузер)
+
+def fetch_views_dzen(url: str):
+    """
+    Открываем страницу в Chromium (headless), ждём загрузки, парсим число.
+    """
+    from playwright.sync_api import sync_playwright
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            context = browser.new_context(user_agent=UA["User-Agent"], locale="ru-RU")
+            page = context.new_page()
+            page.set_default_timeout(15000)  # 15s
+            page.goto(url, wait_until="networkidle")
+            # берём готовый HTML после исполнения JS
+            html = page.content()
+
+            # 1) JSON-LD
+            v = extract_views_jsonld(html)
+            if v is not None:
+                browser.close()
+                return v
+
+            # 2) тексты на странице (узлы, содержащие "Просмотр")
+            try:
+                texts = page.locator("text=просмотр").all_text_contents() + \
+                        page.locator("text=Просмотр").all_text_contents()
+                for t in texts:
+                    m = re.search(r'([\d\s\u00A0,\.]+)', t)
+                    if m:
+                        v = parse_int(m.group(1))
+                        if v is not None:
+                            browser.close()
+                            return v
+            except Exception:
+                pass
+
+            # 3) общий парс HTML
+            v = extract_views_generic(html)
+            browser.close()
+            return v
+    except Exception:
+        return None
 
 # ---------- Flask
 
@@ -256,14 +224,11 @@ def index():
                 for u in by_platform["youtube"]:
                     rows.append((u, "YouTube", yt_map.get(u, "") or ""))
             for u in by_platform["ok"]:
-                v = fetch_views_ok(u)
-                rows.append((u, "OK.ru", v if v is not None else ""))
+                rows.append((u, "OK.ru", fetch_views_ok(u) or ""))
             for u in by_platform["rutube"]:
-                v = fetch_views_rutube(u)
-                rows.append((u, "RuTube", v if v is not None else ""))
+                rows.append((u, "RuTube", fetch_views_rutube(u) or ""))
             for u in by_platform["dzen"]:
-                v = fetch_views_dzen(u)
-                rows.append((u, "Dzen", v if v is not None else ""))
+                rows.append((u, "Dzen", fetch_views_dzen(u) or ""))
             for u in by_platform["unknown"]:
                 rows.append((u, "Unknown", ""))
 

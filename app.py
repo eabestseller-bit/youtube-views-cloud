@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cloud app: YouTube + OK.ru + RuTube + Dzen (надёжный Dzen через Playwright)
+Cloud app: YouTube + OK.ru + RuTube + Dzen
 - YouTube: через API (env YOUTUBE_API_KEY)
 - OK/RuTube: парсинг HTML/JSON-LD
-- Dzen: загрузка страницы браузером (Playwright) + парсинг отрендеренного HTML
+- Dzen: рендер через Playwright (Chromium), чтобы увидеть счётчик на видео
 """
 
 import os, re, csv, io, json
@@ -15,7 +15,7 @@ from flask import Flask, render_template, request, send_file
 import requests
 from bs4 import BeautifulSoup
 
-# ---------- конфиг
+# --------- конфиг
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/videos"
 UA = {
@@ -24,7 +24,7 @@ UA = {
                    "Chrome/124.0 Safari/537.36")
 }
 
-# ---------- helpers
+# --------- утилиты
 
 YT_PATTERNS = [
     r"(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([A-Za-z0-9_\-]{6,})",
@@ -34,9 +34,10 @@ YT_PATTERNS = [
 ]
 
 def normalize_url(u: str) -> str:
+    """Обрезаем query/fragment (?share_to=...) — мешают парсингу."""
     try:
         sp = urlsplit(u.strip())
-        return urlunsplit((sp.scheme, sp.netloc, sp.path, "", ""))  # убираем query/fragment
+        return urlunsplit((sp.scheme, sp.netloc, sp.path, "", ""))
     except Exception:
         return u.strip()
 
@@ -71,6 +72,7 @@ def parse_int(s):
     return None
 
 def extract_views_jsonld(html: str):
+    """Пытаемся найти interactionStatistic→WatchAction→userInteractionCount."""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all("script", {"type": "application/ld+json"}):
         try:
@@ -80,7 +82,7 @@ def extract_views_jsonld(html: str):
         items = data if isinstance(data, list) else [data]
         for obj in items:
             stats = obj.get("interactionStatistic") or obj.get("interactionStatistics")
-            if not stats: 
+            if not stats:
                 continue
             stats = stats if isinstance(stats, list) else [stats]
             for st in stats:
@@ -94,17 +96,20 @@ def extract_views_jsonld(html: str):
     return None
 
 def extract_views_generic(html: str):
-    m = re.search(r'"viewCount"\s*:\s*"?([\d\s,\.]+)"?', html)
-    if m: return parse_int(m.group(1))
-    m = re.search(r'"views"\s*:\s*"?([\d\s,\.]+)"?', html)
-    if m: return parse_int(m.group(1))
-    m = re.search(r'(?:Просмотров|просмотров|ПРОСМОТРОВ)[^\d]{0,10}([\d\s\u00A0,\.]+)', html)
-    if m: return parse_int(m.group(1))
+    for pattern in [
+        r'"viewCount"\s*:\s*"?([\d\s,\.]+)"?',
+        r'"views"\s*:\s*"?([\d\s,\.]+)"?',
+        r'(?:Просмотров|просмотров|ПРОСМОТРОВ)[^\d]{0,10}([\d\s\u00A0,\.]+)',
+    ]:
+        m = re.search(pattern, html)
+        if m:
+            return parse_int(m.group(1))
     return None
 
-# ---------- парсеры площадок (YT/OK/RuTube как раньше)
+# --------- площадки
 
 def fetch_views_ok(url: str):
+    """OK.ru: обычная страница → мобильная m.ok.ru → доп. паттерны."""
     try:
         html = http_get(url)
         v = extract_views_jsonld(html) or extract_views_generic(html)
@@ -156,52 +161,142 @@ def fetch_views_youtube(urls):
                 out[u] = stats.get(vid)
     return out
 
-# ---------- Dzen через Playwright (браузер)
+# --------- Dzen через Playwright (браузер)
 
 def fetch_views_dzen(url: str):
     """
-    Открываем страницу в Chromium (headless), ждём загрузки, парсим число.
+    Открываем страницу в Chromium (headless), ждём рендера,
+    кликаем по видео при необходимости, ищем число в текстах и глобальном стейте.
     """
     from playwright.sync_api import sync_playwright
+
+    def pick_number(texts):
+        import re as _re
+        for t in texts or []:
+            m = _re.search(r'([\d\s\u00A0.,]+)', t)
+            if m:
+                v = parse_int(m.group(1))
+                if v is not None:
+                    return v
+        return None
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-            context = browser.new_context(user_agent=UA["User-Agent"], locale="ru-RU")
+            context = browser.new_context(
+                user_agent=UA["User-Agent"],
+                locale="ru-RU",
+                viewport={"width": 1366, "height": 768},
+            )
             page = context.new_page()
-            page.set_default_timeout(15000)  # 15s
-            page.goto(url, wait_until="networkidle")
-            # берём готовый HTML после исполнения JS
-            html = page.content()
+            page.set_default_timeout(20000)
 
-            # 1) JSON-LD
+            page.goto(url, wait_until="networkidle")
+            page.wait_for_timeout(1200)
+
+            # 1) сначала попробуем JSON-LD из уже отрисованного HTML
+            html = page.content()
             v = extract_views_jsonld(html)
             if v is not None:
                 browser.close()
                 return v
 
-            # 2) тексты на странице (узлы, содержащие "Просмотр")
+            # 2) «пнуть» плеер — иногда после клика появляется оверлей со счетчиком
             try:
-                texts = page.locator("text=просмотр").all_text_contents() + \
-                        page.locator("text=Просмотр").all_text_contents()
-                for t in texts:
-                    m = re.search(r'([\d\s\u00A0,\.]+)', t)
-                    if m:
-                        v = parse_int(m.group(1))
-                        if v is not None:
-                            browser.close()
-                            return v
+                page.click("video", timeout=2000)
+                page.wait_for_timeout(800)
             except Exception:
                 pass
 
-            # 3) общий парс HTML
+            # 2a) собрать текстовые узлы, содержащие «просмотр»
+            texts = page.evaluate("""
+                () => {
+                  const out = [];
+                  const walker = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_TEXT
+                  );
+                  let n;
+                  while ((n = walker.nextNode())) {
+                    const t = (n.textContent || "").trim();
+                    if (!t) continue;
+                    if (/[Пп]росмотр/.test(t) && /\\d/.test(t)) out.push(t);
+                  }
+                  return out.slice(0, 80);
+                }
+            """)
+            v = pick_number(texts)
+            if v is not None:
+                browser.close()
+                return v
+
+            # 3) посмотреть глобальные объекты состояния (если есть)
+            try:
+                data_candidates = page.evaluate("""
+                  () => {
+                    const out = [];
+                    try { if (window.__INITIAL_STATE__) out.push(window.__INITIAL_STATE__); } catch(e){}
+                    try { if (window.__DATA__) out.push(window.__DATA__); } catch(e){}
+                    try { if (window.__ZEN__) out.push(window.__ZEN__); } catch(e){}
+                    return out;
+                  }
+                """)
+                from collections import deque
+                def from_obj(obj):
+                    for k in ("views", "viewCount", "viewsCount", "watchCount"):
+                        try:
+                            pv = parse_int(obj.get(k))
+                            if pv is not None: return pv
+                        except Exception:
+                            pass
+                    for k1 in ("stats", "statistics", "meta", "counters", "analytics"):
+                        try:
+                            inner = obj.get(k1)
+                            if isinstance(inner, dict):
+                                for k2 in ("views", "viewCount", "viewsCount", "watchCount"):
+                                    pv = parse_int(inner.get(k2))
+                                    if pv is not None: return pv
+                        except Exception:
+                            pass
+                    try:
+                        vc = obj.get("viewCounter")
+                        if isinstance(vc, dict):
+                            pv = parse_int(vc.get("count"))
+                            if pv is not None: return pv
+                    except Exception:
+                        pass
+                    return None
+
+                for root in data_candidates or []:
+                    dq, seen = deque([root]), set()
+                    while dq:
+                        cur = dq.popleft()
+                        if id(cur) in seen: 
+                            continue
+                        seen.add(id(cur))
+                        if isinstance(cur, dict):
+                            pv = from_obj(cur)
+                            if pv is not None:
+                                browser.close()
+                                return pv
+                            for v2 in cur.values():
+                                if isinstance(v2, (dict, list)):
+                                    dq.append(v2)
+                        elif isinstance(cur, list):
+                            for v2 in cur:
+                                if isinstance(v2, (dict, list)):
+                                    dq.append(v2)
+            except Exception:
+                pass
+
+            # 4) резерв — общий поиск по HTML
+            html = page.content()
             v = extract_views_generic(html)
             browser.close()
             return v
     except Exception:
         return None
 
-# ---------- Flask
+# --------- Flask
 
 app = Flask(__name__)
 

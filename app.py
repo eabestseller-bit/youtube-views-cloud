@@ -84,11 +84,52 @@ def extract_views_generic(html: str):
     return None
 
 def fetch_views_ok(url: str):
+    """
+    Пытаемся вытащить просмотры с OK.ru:
+    1) пробуем оригинальную ссылку
+    2) пробуем мобильную версию m.ok.ru (часто там данные отдаются сервером)
+    3) несколько шаблонов (JSON-LD + популярные поля)
+    """
     try:
         html = http_get(url)
-        return extract_views_jsonld(html) or extract_views_generic(html)
+        v = extract_views_jsonld(html) or extract_views_generic(html)
+        if v is not None:
+            return v
     except Exception:
-        return None
+        pass
+
+    # Попробуем мобильную версию (сервер часто рендерит больше данных)
+    try:
+        # если ссылка уже мобильная — просто используем её
+        m_url = url
+        if "://ok.ru/" in url and "://m.ok.ru/" not in url:
+            m_url = url.replace("://ok.ru/", "://m.ok.ru/")
+        html = http_get(m_url)
+        # Доп. паттерны для OK:
+        #  - JSON-LD
+        v = extract_views_jsonld(html)
+        if v is not None:
+            return v
+        #  - data-* и inline JSON
+        import re as _re
+        # "viewsCount": 12345
+        m = _re.search(r'"viewsCount"\s*:\s*([0-9]{1,12})', html)
+        if m:
+            return int(m.group(1))
+        # "viewCount": "12 345"
+        m = _re.search(r'"viewCount"\s*:\s*"([\d\s\u00A0,\.]+)"', html)
+        if m:
+            from html import unescape
+            return parse_int(unescape(m.group(1)))
+        # Текстовые варианты (Просмотров 12 345)
+        m = _re.search(r'(?:Просмотров|просмотров)[^\d]{0,10}([\d\s\u00A0,\.]+)', html)
+        if m:
+            return parse_int(m.group(1))
+    except Exception:
+        pass
+
+    return None
+
 
 def fetch_views_rutube(url: str):
     try:

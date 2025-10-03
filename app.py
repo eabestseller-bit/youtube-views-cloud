@@ -2,19 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 Social Views Checker
-Поддержка: YouTube + OK.ru + RuTube + Dzen + VK + Telegram
+Поддержка: YouTube + OK.ru + RuTube + Dzen + VK (vk.com/vkvideo.ru) + Telegram
 
 - YouTube: API (env YOUTUBE_API_KEY)
 - OK/RuTube: HTML/JSON-LD
-- Dzen: Playwright (Chromium) — чтобы увидеть счётчик, дорисованный JS
-- VK (vk.com / vkvideo.ru): HTML + мобильная m.vk.com
-- Telegram (t.me): HTML
+- Dzen: Playwright (Chromium)
+- VK: HTML + мобильная m.vk.com, расширенные паттерны
+- Telegram: HTML (виджет)
 
-Доп. флаг:
-- DISABLE_DZEN=1  — пропускает сбор с Дзена (не блокирует остальное на слабых инстансах)
+Флаги окружения:
+- YOUTUBE_API_KEY=...  — ключ для YouTube Data API v3
+- DISABLE_DZEN=1       — пропустить Dzen (ускоряет тест на слабых инстансах)
 """
 
-import os, re, csv, io, json
+import os, re, csv, io, json, sys, logging
 from datetime import date
 from urllib.parse import urlsplit, urlunsplit
 
@@ -22,7 +23,15 @@ from flask import Flask, render_template, request, send_file
 import requests
 from bs4 import BeautifulSoup
 
-# --------- конфиг
+# ---------- логирование ----------
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+log = logging.getLogger("views")
+
+# ---------- конфиг ----------
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/videos"
 DISABLE_DZEN = os.getenv("DISABLE_DZEN", "0") == "1"
@@ -34,7 +43,7 @@ UA = {
     )
 }
 
-# --------- утилиты
+# ---------- утилиты ----------
 
 YT_PATTERNS = [
     r"(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([A-Za-z0-9_\-]{6,})",
@@ -71,6 +80,7 @@ def yt_extract_id(token: str):
 
 def http_get(url: str) -> str:
     r = requests.get(url, headers=UA, timeout=25)
+    log.info(f"[GET] {r.status_code} {url} (len={len(r.text) if r.text else 0})")
     r.raise_for_status()
     return r.text
 
@@ -119,53 +129,63 @@ def extract_views_generic(html: str):
             return parse_int(m.group(1))
     return None
 
-# --------- площадки
+# ---------- площадки ----------
 
 def fetch_views_ok(url: str):
-    """OK.ru: обычная → мобильная m.ok.ru → доп.поля."""
+    log.info(f"[OK] start: {url}")
     try:
         html = http_get(url)
         v = extract_views_jsonld(html) or extract_views_generic(html)
-        if v is not None: return v
-    except Exception:
-        pass
+        if v is not None:
+            log.info(f"[OK] found: {v}")
+            return v
+    except Exception as e:
+        log.info(f"[OK] error: {e}")
     try:
         m_url = url if "://m.ok.ru/" in url else url.replace("://ok.ru/", "://m.ok.ru/")
         html = http_get(m_url)
         v = extract_views_jsonld(html)
-        if v is not None: return v
+        if v is not None:
+            log.info(f"[OK] found (m): {v}")
+            return v
         m = re.search(r'"viewsCount"\s*:\s*([0-9]{1,12})', html)
         if m: return int(m.group(1))
         m = re.search(r'"viewCount"\s*:\s*"([\d\s\u00A0,\.]+)"', html)
         if m: return parse_int(m.group(1))
         m = re.search(r'(?:Просмотров|просмотров)[^\d]{0,10}([\d\s\u00A0,\.]+)', html)
         if m: return parse_int(m.group(1))
-    except Exception:
-        pass
+    except Exception as e:
+        log.info(f"[OK] error (m): {e}")
+    log.info("[OK] not found")
     return None
 
 def fetch_views_rutube(url: str):
+    log.info(f"[RT] start: {url}")
     try:
         html = http_get(url)
-        return extract_views_jsonld(html) or extract_views_generic(html)
-    except Exception:
+        v = extract_views_jsonld(html) or extract_views_generic(html)
+        log.info(f"[RT] result: {v}")
+        return v
+    except Exception as e:
+        log.info(f"[RT] error: {e}")
         return None
 
 def fetch_views_youtube(urls):
+    out = {u: None for u in urls}
+    if not urls or not YOUTUBE_API_KEY:
+        return out
     ids, id_by_url = [], {}
     for u in urls:
         vid = yt_extract_id(u)
         if vid and vid not in id_by_url:
             id_by_url[u] = vid
             ids.append(vid)
-    out = {u: None for u in urls}
-    if not ids or not YOUTUBE_API_KEY:
-        return out
     for i in range(0, len(ids), 50):
         batch = ids[i:i+50]
         r = requests.get(YOUTUBE_API_URL, params={
             "part": "statistics", "id": ",".join(batch), "key": YOUTUBE_API_KEY
         }, timeout=25)
+        log.info(f"[YT] API {r.status_code} ids={len(batch)}")
         r.raise_for_status()
         data = r.json()
         stats = {it["id"]: it.get("statistics", {}).get("viewCount") for it in data.get("items", [])}
@@ -180,11 +200,11 @@ def fetch_views_vk(url: str):
     VK / VK Video:
     - Пытаемся по самому URL
     - Если это vkvideo.ru, строим эквиваленты на vk.com и m.vk.com
-    - Куча шаблонов: JSON, data-атрибуты, aria-label, текст, укороченные K/M
-    Возвращает int или None.
+    - Куча шаблонов: JSON, data-атрибуты, aria-label, текст, K/M
     """
+    log.info(f"[VK] start: {url}")
+
     def parse_km(num_str: str):
-        # Поддержка 12.3K / 1.2M
         m = re.search(r'^\s*([\d\s\u00A0,\.]+)\s*([KkMm])\s*$', num_str)
         if m:
             base = parse_int(m.group(1))
@@ -194,22 +214,17 @@ def fetch_views_vk(url: str):
         return parse_int(num_str)
 
     def try_parse(html: str):
-        # 1) JSON-LD
+        # JSON-LD
         v = extract_views_jsonld(html)
         if v is not None:
             return v
-
-        # 2) Частые JSON-поля
-        # "views":{"count":12345}
+        # JSON-поля
         m = re.search(r'"views"\s*:\s*\{\s*"count"\s*:\s*([0-9]{1,12})\s*\}', html)
         if m: return int(m.group(1))
-        # "views_count":12345
         m = re.search(r'"views_count"\s*:\s*([0-9]{1,12})', html)
         if m: return int(m.group(1))
-        # "count_views":12345
         m = re.search(r'"count_views"\s*:\s*([0-9]{1,12})', html)
         if m: return int(m.group(1))
-        # "viewCount":"12 345" | "views":"12.3K"
         m = re.search(r'"viewCount"\s*:\s*"([^"]+)"', html)
         if m:
             v = parse_km(m.group(1))
@@ -218,92 +233,80 @@ def fetch_views_vk(url: str):
         if m:
             v = parse_km(m.group(1))
             if v is not None: return v
-
-        # 3) Объекты mvData / mv_data и пр.
-        # ... "mvData": { "views": 12345 } ...
+        # mvData / mv_data
         m = re.search(r'"mvData"\s*:\s*\{[^}]*?"views"\s*:\s*([0-9]{1,12})', html, re.DOTALL)
         if m: return int(m.group(1))
         m = re.search(r'"mv_data"\s*:\s*\{[^}]*?"views"\s*:\s*([0-9]{1,12})', html, re.DOTALL)
         if m: return int(m.group(1))
-
-        # 4) Атрибуты / элементы верстки
-        # aria-label="12 345 просмотров"
+        # Атрибуты/верстка
         m = re.search(r'aria-label="([^"]+?)"', html, re.IGNORECASE)
         if m and ("просмотр" in m.group(1).lower() or "views" in m.group(1).lower()):
             v = parse_km(m.group(1))
             if v is None:
-                # вытащим чисто цифру из aria-label
                 m2 = re.search(r'([\d\s\u00A0,\.]+[KkMm]?)', m.group(1))
                 if m2:
                     v = parse_km(m2.group(1))
             if v is not None:
                 return v
-
-        # data-views="12345"
         m = re.search(r'data-views\s*=\s*"([0-9]{1,12})"', html)
         if m: return int(m.group(1))
-
-        # class="mv_views">12 345<
         m = re.search(r'class="[^"]*mv[_-]?views[^"]*"\s*[^>]*>\s*([\d\s\u00A0,\.KkMm]+)\s*<', html)
         if m:
             v = parse_km(m.group(1))
             if v is not None: return v
-
-        # 5) Текстовые варианты по всей странице
+        # Текстовые варианты
         m = re.search(r'(?:Просмотров|просмотров|Views|views)[^\dKkMm]{0,12}([\d\s\u00A0,\.KkMm]+)', html)
         if m:
             v = parse_km(m.group(1))
             if v is not None: return v
-
         return None
 
-    # Попробуем сам URL
+    # 1) сам URL
     try:
         html = http_get(url)
         v = try_parse(html)
         if v is not None:
+            log.info(f"[VK] found: {v}")
             return v
-    except Exception:
-        pass
+    except Exception as e:
+        log.info(f"[VK] error: {e}")
 
-    # Если это vkvideo.ru — попробуем эквиваленты на vk.com + m.vk.com
+    # 2) альтернативы
     alt_urls = []
     try:
         low = url.lower()
         if "vkvideo.ru" in low:
-            # Пример: https://vkvideo.ru/video-48064554_456242034
             m = re.search(r'/video([-\d_]+)', url)
             if m:
-                tail = m.group(1)  # "-48064554_456242034"
+                tail = m.group(1)  # -48064554_456242034
                 alt_urls.append(f"https://vk.com/video{tail}")
                 alt_urls.append(f"https://m.vk.com/video{tail}")
     except Exception:
         pass
-
-    # Ещё попробуем мобильную версию для обычного vk.com
     if "vk.com" in url and "m.vk.com" not in url:
         alt_urls.append(url.replace("://vk.com/", "://m.vk.com/"))
 
-    # Обойти альтернативы
     for u2 in alt_urls:
+        log.info(f"[VK] alt: {u2}")
         try:
             html = http_get(u2)
             v = try_parse(html)
             if v is not None:
+                log.info(f"[VK] found alt: {v}")
                 return v
-        except Exception:
-            continue
+        except Exception as e:
+            log.info(f"[VK] alt error: {e}")
 
+    log.info("[VK] not found")
     return None
-
 
 # ---- Telegram (t.me)
 def fetch_views_telegram(url: str):
     """
-    Telegram: ищем .tgme_widget_message_views, .tgme_widget_message_meta/info и резерв по HTML.
-    Поддерживаем суффиксы K/M (12.3K → 12300).
-    Пытаемся также зеркало /s/<channel>/<id>.
+    Telegram: .tgme_widget_message_views / _meta / _info; поддержка K/M; пробуем зеркало /s/.
     """
+    log.info(f"[TG] start: {url}")
+
     def parse_page(html: str):
         soup = BeautifulSoup(html, "html.parser")
         el = soup.select_one(".tgme_widget_message_views")
@@ -326,33 +329,41 @@ def fetch_views_telegram(url: str):
         if v is not None: return v
         return None
 
-    # как есть
+    # оригинал
     try:
         html = http_get(url)
         v = parse_page(html)
-        if v is not None: return v
-    except Exception:
-        pass
+        if v is not None:
+            log.info(f"[TG] found: {v}")
+            return v
+    except Exception as e:
+        log.info(f"[TG] error: {e}")
 
-    # зеркальный /s/ (часто стабильнее)
+    # зеркало /s/
     try:
         sp = urlsplit(url)
         parts = sp.path.strip("/").split("/")
         if len(parts) >= 2 and parts[0] != "s":
             mirror = urlunsplit((sp.scheme or "https", sp.netloc, "/s/" + "/".join(parts), "", ""))
+            log.info(f"[TG] mirror: {mirror}")
             html = http_get(mirror)
             v = parse_page(html)
-            if v is not None: return v
-    except Exception:
-        pass
+            if v is not None:
+                log.info(f"[TG] found mirror: {v}")
+                return v
+    except Exception as e:
+        log.info(f"[TG] mirror error: {e}")
 
+    log.info("[TG] not found")
     return None
 
-# --------- Dzen через Playwright (по желанию включается/выключается флагом)
+# --------- Dzen (Playwright), можно отключить флагом DISABLE_DZEN=1 ----------
 def fetch_views_dzen(url: str):
     if DISABLE_DZEN:
+        log.info("[DZEN] disabled by env")
         return None
 
+    log.info(f"[DZEN] start: {url}")
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
     def pick_number_from_texts(texts):
@@ -387,6 +398,7 @@ def fetch_views_dzen(url: str):
                 v = extract_views_jsonld(html)
                 if v is not None:
                     browser.close()
+                    log.info(f"[DZEN] found: {v}")
                     return v
 
                 texts = page.evaluate("""
@@ -405,69 +417,14 @@ def fetch_views_dzen(url: str):
                 v = pick_number_from_texts(texts)
                 if v is not None:
                     browser.close()
+                    log.info(f"[DZEN] found text: {v}")
                     return v
 
-                try:
-                    data_candidates = page.evaluate("""
-                      () => {
-                        const out = [];
-                        try { if (window.__INITIAL_STATE__) out.push(window.__INITIAL_STATE__); } catch(e){}
-                        try { if (window.__DATA__) out.push(window.__DATA__); } catch(e){}
-                        try { if (window.__ZEN__) out.push(window.__ZEN__); } catch(e){}
-                        return out;
-                      }
-                    """)
-                    from collections import deque
-                    def from_obj(obj):
-                        for k in ("views", "viewCount", "viewsCount", "watchCount"):
-                            try:
-                                pv = parse_int(obj.get(k))
-                                if pv is not None: return pv
-                            except Exception:
-                                pass
-                        for k1 in ("stats", "statistics", "meta", "counters", "analytics"):
-                            try:
-                                inner = obj.get(k1)
-                                if isinstance(inner, dict):
-                                    for k2 in ("views", "viewCount", "viewsCount", "watchCount"):
-                                        pv = parse_int(inner.get(k2))
-                                        if pv is not None: return pv
-                            except Exception:
-                                pass
-                        try:
-                            vc = obj.get("viewCounter")
-                            if isinstance(vc, dict):
-                                pv = parse_int(vc.get("count"))
-                                if pv is not None: return pv
-                        except Exception:
-                            pass
-                        return None
-
-                    for root in data_candidates or []:
-                        dq, seen = deque([root]), set()
-                        while dq:
-                            cur = dq.popleft()
-                            if id(cur) in seen: 
-                                continue
-                            seen.add(id(cur))
-                            if isinstance(cur, dict):
-                                pv = from_obj(cur)
-                                if pv is not None:
-                                    browser.close()
-                                    return pv
-                                for v2 in cur.values():
-                                    if isinstance(v2, (dict, list)):
-                                        dq.append(v2)
-                            elif isinstance(cur, list):
-                                for v2 in cur:
-                                    if isinstance(v2, (dict, list)):
-                                        dq.append(v2)
-                except Exception:
-                    pass
-
+                # резерв — общий HTML
                 v = extract_views_generic(html)
                 if v is not None:
                     browser.close()
+                    log.info(f"[DZEN] found generic: {v}")
                     return v
 
                 try:
@@ -477,11 +434,13 @@ def fetch_views_dzen(url: str):
                 page.wait_for_timeout(800)
 
             browser.close()
+            log.info("[DZEN] not found")
             return None
-    except Exception:
+    except Exception as e:
+        log.info(f"[DZEN] error: {e}")
         return None
 
-# --------- Flask
+# ---------- Flask ----------
 
 app = Flask(__name__)
 
@@ -491,6 +450,7 @@ def index():
     links = ""
     rows = None
     if request.method == "POST":
+        log.info("[POST] / – получен запрос на проверку ссылок")
         try:
             links = request.form.get("links", "")
             urls = [normalize_url(u) for u in links.splitlines() if u.strip()]
@@ -522,6 +482,7 @@ def index():
 
         except Exception as e:
             error = str(e)
+            log.info(f"[POST] error: {e}")
 
     return render_template("index.html", rows=rows, links=links, today=date.today(), error=error, dzen_disabled=DISABLE_DZEN)
 
@@ -566,6 +527,16 @@ def download():
         as_attachment=True,
         download_name=f"social_views_{date.today()}.csv"
     )
+
+# Отдельный debug-эндпоинт для быстрой проверки VK
+@app.route("/debug/vk")
+def debug_vk():
+    u = request.args.get("u", "")
+    if not u:
+        return "pass ?u=<vk-url>", 400
+    log.info(f"[DEBUG] /debug/vk u={u}")
+    val = fetch_views_vk(u)
+    return {"url": u, "views": val}, 200
 
 @app.route("/healthz")
 def healthz():

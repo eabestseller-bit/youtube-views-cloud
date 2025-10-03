@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cloud app: YouTube + OK.ru + RuTube + Dzen
-- YouTube: через API (env YOUTUBE_API_KEY)
-- OK/RuTube: парсинг HTML/JSON-LD
-- Dzen: рендер через Playwright (Chromium) с несколькими попытками
+Cloud app: YouTube + OK.ru + RuTube + Dzen + VK + Telegram
+- YouTube: API (env YOUTUBE_API_KEY)
+- OK/RuTube: HTML/JSON-LD
+- Dzen: Playwright (Chromium) для отрисованного счётчика
+- VK (vk.com, vkvideo.ru): HTML + мобильная m.vk.com
+- Telegram (t.me): HTML (класс .tgme_widget_message_views)
 """
 
 import os, re, csv, io, json
@@ -48,6 +50,8 @@ def detect_platform(url: str) -> str:
     if "ok.ru" in u or "odnoklassniki" in u: return "ok"
     if "rutube.ru" in u: return "rutube"
     if "dzen.ru" in u or "zen.yandex" in u: return "dzen"
+    if "vk.com" in u or "vkvideo.ru" in u or "vkontakte" in u: return "vk"
+    if "t.me" in u or "telegram.me" in u: return "telegram"
     return "unknown"
 
 def yt_extract_id(token: str):
@@ -162,8 +166,88 @@ def fetch_views_youtube(urls):
                 out[u] = stats.get(vid)
     return out
 
-# --------- Dzen через Playwright (с несколькими попытками)
+# ---- VK (vk.com / vkvideo.ru)
+def fetch_views_vk(url: str):
+    """
+    Пытаемся получить просмотры с VK. Для публичных видео часто достаточно HTML.
+    Пробуем:
+      - JSON-LD
+      - Частые JSON-поля: "views":{"count":12345}, "views_count": 12345, "views":"12 345"
+      - Текст "просмотров ..."
+      - Мобильную версию m.vk.com
+    """
+    def try_parse(html: str):
+        v = extract_views_jsonld(html)
+        if v is not None:
+            return v
+        # JSON-структуры
+        m = re.search(r'"views"\s*:\s*\{\s*"count"\s*:\s*([0-9]{1,12})\s*\}', html)
+        if m: return int(m.group(1))
+        m = re.search(r'"views_count"\s*:\s*([0-9]{1,12})', html)
+        if m: return int(m.group(1))
+        m = re.search(r'"viewCount"\s*:\s*"([\d\s\u00A0,\.]+)"', html)
+        if m: return parse_int(m.group(1))
+        # Текстовые варианты
+        m = re.search(r'(?:Просмотров|просмотров)[^\d]{0,10}([\d\s\u00A0,\.]+)', html)
+        if m: return parse_int(m.group(1))
+        return None
 
+    # 1) Обычная страница
+    try:
+        html = http_get(url)
+        v = try_parse(html)
+        if v is not None:
+            return v
+    except Exception:
+        pass
+
+    # 2) Мобильная (часто богаче данными)
+    try:
+        m_url = url
+        if "://m.vk.com/" not in url and "://vkvideo.ru/" not in url:
+            m_url = url.replace("://vk.com/", "://m.vk.com/")
+        html = http_get(m_url)
+        v = try_parse(html)
+        if v is not None:
+            return v
+    except Exception:
+        pass
+
+    return None
+
+# ---- Telegram (t.me)
+def fetch_views_telegram(url: str):
+    """
+    t.me обычно отдаёт счётчик в HTML.
+    Ищем span с классом .tgme_widget_message_views или рядом с ним.
+    """
+    try:
+        html = http_get(url)
+        soup = BeautifulSoup(html, "html.parser")
+        # основной счётчик
+        el = soup.select_one(".tgme_widget_message_views")
+        if el:
+            v = parse_int(el.get_text(strip=True))
+            if v is not None:
+                return v
+        # иногда бывает в info-блоке
+        info = soup.select_one(".tgme_widget_message_info")
+        if info:
+            text = info.get_text(" ", strip=True)
+            m = re.search(r'([\d\s\u00A0,\.]+)', text or "")
+            if m:
+                v = parse_int(m.group(1))
+                if v is not None:
+                    return v
+        # резерв — общий парс
+        v = extract_views_generic(html)
+        if v is not None:
+            return v
+    except Exception:
+        pass
+    return None
+
+# --------- Dzen через Playwright (с несколькими попытками)
 def fetch_views_dzen(url: str):
     """
     Открываем страницу в Chromium (headless), ждём рендера,
@@ -200,18 +284,7 @@ def fetch_views_dzen(url: str):
                 except PWTimeout:
                     pass
 
-                # попробуем дождаться появления любого текста с «просмотр»
-                had_selector = False
-                for sel in ["text=/просмотр/i", "text=/просмотров/i", "text=/Просмотр/i", "text=/Просмотров/i"]:
-                    try:
-                        page.wait_for_selector(sel, timeout=5000)
-                        had_selector = True
-                        break
-                    except PWTimeout:
-                        continue
-
                 html = page.content()
-
                 # 1) JSON-LD
                 v = extract_views_jsonld(html)
                 if v is not None:
@@ -278,7 +351,7 @@ def fetch_views_dzen(url: str):
                         dq, seen = deque([root]), set()
                         while dq:
                             cur = dq.popleft()
-                            if id(cur) in seen: 
+                            if id(cur) in seen:
                                 continue
                             seen.add(id(cur))
                             if isinstance(cur, dict):
@@ -327,21 +400,35 @@ def index():
         try:
             links = request.form.get("links", "")
             urls = [normalize_url(u) for u in links.splitlines() if u.strip()]
-            by_platform = {"youtube": [], "ok": [], "rutube": [], "dzen": [], "unknown": []}
+            by_platform = {
+                "youtube": [], "ok": [], "rutube": [],
+                "dzen": [], "vk": [], "telegram": [], "unknown": []
+            }
             for u in urls:
                 by_platform[detect_platform(u)].append(u)
 
             rows = []
+            # YouTube
             if by_platform["youtube"]:
                 yt_map = fetch_views_youtube(by_platform["youtube"])
                 for u in by_platform["youtube"]:
                     rows.append((u, "YouTube", yt_map.get(u, "") or ""))
+            # OK
             for u in by_platform["ok"]:
                 rows.append((u, "OK.ru", fetch_views_ok(u) or ""))
+            # RuTube
             for u in by_platform["rutube"]:
                 rows.append((u, "RuTube", fetch_views_rutube(u) or ""))
+            # Dzen
             for u in by_platform["dzen"]:
                 rows.append((u, "Dzen", fetch_views_dzen(u) or ""))
+            # VK
+            for u in by_platform["vk"]:
+                rows.append((u, "VK", fetch_views_vk(u) or ""))
+            # Telegram
+            for u in by_platform["telegram"]:
+                rows.append((u, "Telegram", fetch_views_telegram(u) or ""))
+            # Unknown
             for u in by_platform["unknown"]:
                 rows.append((u, "Unknown", ""))
 
@@ -358,7 +445,10 @@ def download():
     w = csv.writer(output)
     w.writerow(["url", "platform", "views"])
 
-    by_platform = {"youtube": [], "ok": [], "rutube": [], "dzen": [], "unknown": []}
+    by_platform = {
+        "youtube": [], "ok": [], "rutube": [],
+        "dzen": [], "vk": [], "telegram": [], "unknown": []
+    }
     for u in urls:
         by_platform[detect_platform(u)].append(u)
     yt_map = fetch_views_youtube(by_platform["youtube"]) if by_platform["youtube"] else {}
@@ -373,6 +463,10 @@ def download():
             w.writerow([u, "RuTube", fetch_views_rutube(u) or ""])
         elif p == "dzen":
             w.writerow([u, "Dzen", fetch_views_dzen(u) or ""])
+        elif p == "vk":
+            w.writerow([u, "VK", fetch_views_vk(u) or ""])
+        elif p == "telegram":
+            w.writerow([u, "Telegram", fetch_views_telegram(u) or ""])
         else:
             w.writerow([u, "Unknown", ""])
 

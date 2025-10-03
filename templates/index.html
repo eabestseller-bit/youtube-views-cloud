@@ -6,11 +6,12 @@
   <title>Social Views Checker</title>
   <link rel="stylesheet" href="https://unpkg.com/mvp.css">
   <style>
-    textarea { width: 100%; min-height: 180px; }
+    textarea { width: 100%; min-height: 200px; }
     .container { max-width: 900px; margin: 0 auto; }
     table { width: 100%; }
     .error { background: #ffe9e9; padding: 10px 14px; border-radius: 8px; color: #900; }
     .note { color:#666; font-size:14px; margin-top:8px; }
+    code { background:#f6f8fa; padding:2px 6px; border-radius:6px; }
   </style>
 </head>
 <body>
@@ -32,8 +33,15 @@ https://dzen.ru/video/watch/XXXXXXXXXXXX
 https://vk.com/video-12345_67890
 https://vkvideo.ru/video-123456789
 https://t.me/somechannel/1234">{{ links }}</textarea>
+
       <button type="submit">Показать просмотры</button>
-      <p class="note">Совет: для Dzen лучше вставлять ссылку без хвостов (?share_to=...). Первый запрос может занимать 2–6 сек — запускается браузер.</p>
+      <p class="note">
+        {% if dzen_disabled %}
+          Dzen сейчас <b>отключён</b> флагом окружения <code>DISABLE_DZEN=1</code>. Убери переменную, чтобы включить.
+        {% else %}
+          Для Dzen лучше вставлять ссылку без хвостов (без <code>?share_to=...</code>). Первый запрос может занимать 2–6 сек — запускается браузер.
+        {% endif %}
+      </p>
     </form>
 
     {% if rows %}

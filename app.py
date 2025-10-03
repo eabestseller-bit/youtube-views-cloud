@@ -7,8 +7,11 @@ Social Views Checker
 - YouTube: API (env YOUTUBE_API_KEY)
 - OK/RuTube: HTML/JSON-LD
 - Dzen: Playwright (Chromium) — чтобы увидеть счётчик, дорисованный JS
-- VK (vk.com / vkvideo.ru): HTML + мобильная m.vk.com (часто богаче данными)
-- Telegram (t.me): HTML (счётчик в разметке)
+- VK (vk.com / vkvideo.ru): HTML + мобильная m.vk.com
+- Telegram (t.me): HTML
+
+Доп. флаг:
+- DISABLE_DZEN=1  — пропускает сбор с Дзена (не блокирует остальное на слабых инстансах)
 """
 
 import os, re, csv, io, json
@@ -22,6 +25,8 @@ from bs4 import BeautifulSoup
 # --------- конфиг
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/videos"
+DISABLE_DZEN = os.getenv("DISABLE_DZEN", "0") == "1"
+
 UA = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -79,7 +84,7 @@ def parse_int(s):
     return None
 
 def extract_views_jsonld(html: str):
-    """Ищем interactionStatistic→WatchAction→userInteractionCount в JSON-LD."""
+    """Ищем interactionStatistic→WatchAction→userInteractionCount в JSON-LD (если сайт отдал)."""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all("script", {"type": "application/ld+json"}):
         try:
@@ -103,6 +108,7 @@ def extract_views_jsonld(html: str):
     return None
 
 def extract_views_generic(html: str):
+    """Общие эвристики по разметке."""
     for pattern in [
         r'"viewCount"\s*:\s*"?([\d\s,\.]+)"?',
         r'"views"\s*:\s*"?([\d\s,\.]+)"?',
@@ -116,7 +122,7 @@ def extract_views_generic(html: str):
 # --------- площадки
 
 def fetch_views_ok(url: str):
-    """OK.ru: обычная страница → мобильная m.ok.ru → доп. паттерны."""
+    """OK.ru: обычная → мобильная m.ok.ru → доп.поля."""
     try:
         html = http_get(url)
         v = extract_views_jsonld(html) or extract_views_generic(html)
@@ -171,28 +177,26 @@ def fetch_views_youtube(urls):
 # ---- VK (vk.com / vkvideo.ru)
 def fetch_views_vk(url: str):
     """
-    VK: пробуем обычную страницу и m.vk.com, много популярных шаблонов.
+    VK: пробуем обычную страницу и m.vk.com, набор частых полей и текстов.
     """
     def try_parse(html: str):
         v = extract_views_jsonld(html)
         if v is not None: return v
-        # "views":{"count":12345}
+        # JSON
         m = re.search(r'"views"\s*:\s*\{\s*"count"\s*:\s*([0-9]{1,12})\s*\}', html)
         if m: return int(m.group(1))
-        # "views_count": 12345
         m = re.search(r'"views_count"\s*:\s*([0-9]{1,12})', html)
         if m: return int(m.group(1))
-        # "viewCount":"12 345"
         m = re.search(r'"viewCount"\s*:\s*"([\d\s\u00A0,\.]+)"', html)
         if m: return parse_int(m.group(1))
-        # "views":"12 345"
         m = re.search(r'"views"\s*:\s*"([\d\s\u00A0,\.]+)"', html)
         if m: return parse_int(m.group(1))
-        # aria-label="12 345 просмотров"
+        m = re.search(r'"count_views"\s*:\s*([0-9]{1,12})', html)
+        if m: return int(m.group(1))
+        # Атрибут/текст
         m = re.search(r'aria-label="([\d\s\u00A0,\.]+)\s+просмотр', html, re.IGNORECASE)
         if m: return parse_int(m.group(1))
-        # общий текст
-        m = re.search(r'(?:Просмотров|просмотров|views)[^\d]{0,12}([\d\s\u00A0,\.]+)', html)
+        m = re.search(r'(?:Просмотров|просмотров|views)[^\d]{0,12}([\d\s\u00A0,\.]+)', html, re.IGNORECASE)
         if m: return parse_int(m.group(1))
         return None
 
@@ -216,46 +220,59 @@ def fetch_views_vk(url: str):
 # ---- Telegram (t.me)
 def fetch_views_telegram(url: str):
     """
-    Telegram: ищем .tgme_widget_message_views, .tgme_widget_message_meta и резерв по HTML.
+    Telegram: ищем .tgme_widget_message_views, .tgme_widget_message_meta/info и резерв по HTML.
     Поддерживаем суффиксы K/M (12.3K → 12300).
+    Пытаемся также зеркало /s/<channel>/<id>.
     """
-    try:
-        html = http_get(url)
+    def parse_page(html: str):
         soup = BeautifulSoup(html, "html.parser")
-
         el = soup.select_one(".tgme_widget_message_views")
         if el:
             v = parse_int(el.get_text(strip=True))
             if v is not None: return v
-
-        meta = soup.select_one(".tgme_widget_message_meta")
+        meta = soup.select_one(".tgme_widget_message_meta") or soup.select_one(".tgme_widget_message_info")
         if meta:
             txt = meta.get_text(" ", strip=True)
             m = re.search(r'([\d\s\u00A0,\.]+[KkMm]?)', txt)
             if m:
                 num = m.group(1)
-                if re.search(r'[KkMm]$', num):
-                    base = parse_int(num[:-1])
-                    if base is not None:
-                        mult = 1_000 if num[-1] in 'Kk' else 1_000_000
-                        return base * mult
-                else:
-                    v = parse_int(num)
-                    if v is not None: return v
-
+                if re.search(r'[Kk]$', num):
+                    base = parse_int(num[:-1]);  return base * 1_000 if base is not None else None
+                if re.search(r'[Mm]$', num):
+                    base = parse_int(num[:-1]);  return base * 1_000_000 if base is not None else None
+                v = parse_int(num)
+                if v is not None: return v
         v = extract_views_generic(html)
+        if v is not None: return v
+        return None
+
+    # как есть
+    try:
+        html = http_get(url)
+        v = parse_page(html)
         if v is not None: return v
     except Exception:
         pass
+
+    # зеркальный /s/ (часто стабильнее)
+    try:
+        sp = urlsplit(url)
+        parts = sp.path.strip("/").split("/")
+        if len(parts) >= 2 and parts[0] != "s":
+            mirror = urlunsplit((sp.scheme or "https", sp.netloc, "/s/" + "/".join(parts), "", ""))
+            html = http_get(mirror)
+            v = parse_page(html)
+            if v is not None: return v
+    except Exception:
+        pass
+
     return None
 
-# --------- Dzen через Playwright (с несколькими попытками)
+# --------- Dzen через Playwright (по желанию включается/выключается флагом)
 def fetch_views_dzen(url: str):
-    """
-    Открываем страницу в Chromium (headless), ждём рендера,
-    пробуем: JSON-LD → текстовые узлы с 'просмотр' → глобальные объекты → общий HTML.
-    Делаем до 3 попыток, «пинаем» видео кликом между попытками.
-    """
+    if DISABLE_DZEN:
+        return None
+
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
     def pick_number_from_texts(texts):
@@ -272,13 +289,14 @@ def fetch_views_dzen(url: str):
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
             context = browser.new_context(
-                user_agent=UA["User-Agent"], locale="ru-RU",
+                user_agent=UA["User-Agent"],
+                locale="ru-RU",
                 viewport={"width": 1366, "height": 768},
             )
             page = context.new_page()
             page.set_default_timeout(25000)
 
-            for attempt in range(3):
+            for _ in range(3):
                 page.goto(url, wait_until="domcontentloaded")
                 try:
                     page.wait_for_load_state("networkidle", timeout=7000)
@@ -286,7 +304,6 @@ def fetch_views_dzen(url: str):
                     pass
 
                 html = page.content()
-
                 v = extract_views_jsonld(html)
                 if v is not None:
                     browser.close()
@@ -414,7 +431,8 @@ def index():
             for u in by_platform["rutube"]:
                 rows.append((u, "RuTube", fetch_views_rutube(u) or ""))
             for u in by_platform["dzen"]:
-                rows.append((u, "Dzen", fetch_views_dzen(u) or ""))
+                val = "" if DISABLE_DZEN else (fetch_views_dzen(u) or "")
+                rows.append((u, "Dzen", val))
             for u in by_platform["vk"]:
                 rows.append((u, "VK", fetch_views_vk(u) or ""))
             for u in by_platform["telegram"]:
@@ -425,7 +443,7 @@ def index():
         except Exception as e:
             error = str(e)
 
-    return render_template("index.html", rows=rows, links=links, today=date.today(), error=error)
+    return render_template("index.html", rows=rows, links=links, today=date.today(), error=error, dzen_disabled=DISABLE_DZEN)
 
 @app.route("/download", methods=["POST"])
 def download():
@@ -452,7 +470,8 @@ def download():
         elif p == "rutube":
             w.writerow([u, "RuTube", fetch_views_rutube(u) or ""])
         elif p == "dzen":
-            w.writerow([u, "Dzen", fetch_views_dzen(u) or ""])
+            val = "" if DISABLE_DZEN else (fetch_views_dzen(u) or "")
+            w.writerow([u, "Dzen", val])
         elif p == "vk":
             w.writerow([u, "VK", fetch_views_vk(u) or ""])
         elif p == "telegram":

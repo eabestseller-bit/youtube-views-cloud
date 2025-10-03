@@ -177,45 +177,125 @@ def fetch_views_youtube(urls):
 # ---- VK (vk.com / vkvideo.ru)
 def fetch_views_vk(url: str):
     """
-    VK: пробуем обычную страницу и m.vk.com, набор частых полей и текстов.
+    VK / VK Video:
+    - Пытаемся по самому URL
+    - Если это vkvideo.ru, строим эквиваленты на vk.com и m.vk.com
+    - Куча шаблонов: JSON, data-атрибуты, aria-label, текст, укороченные K/M
+    Возвращает int или None.
     """
+    def parse_km(num_str: str):
+        # Поддержка 12.3K / 1.2M
+        m = re.search(r'^\s*([\d\s\u00A0,\.]+)\s*([KkMm])\s*$', num_str)
+        if m:
+            base = parse_int(m.group(1))
+            if base is None: return None
+            mult = 1_000 if m.group(2).lower() == 'k' else 1_000_000
+            return base * mult
+        return parse_int(num_str)
+
     def try_parse(html: str):
+        # 1) JSON-LD
         v = extract_views_jsonld(html)
-        if v is not None: return v
-        # JSON
+        if v is not None:
+            return v
+
+        # 2) Частые JSON-поля
+        # "views":{"count":12345}
         m = re.search(r'"views"\s*:\s*\{\s*"count"\s*:\s*([0-9]{1,12})\s*\}', html)
         if m: return int(m.group(1))
+        # "views_count":12345
         m = re.search(r'"views_count"\s*:\s*([0-9]{1,12})', html)
         if m: return int(m.group(1))
-        m = re.search(r'"viewCount"\s*:\s*"([\d\s\u00A0,\.]+)"', html)
-        if m: return parse_int(m.group(1))
-        m = re.search(r'"views"\s*:\s*"([\d\s\u00A0,\.]+)"', html)
-        if m: return parse_int(m.group(1))
+        # "count_views":12345
         m = re.search(r'"count_views"\s*:\s*([0-9]{1,12})', html)
         if m: return int(m.group(1))
-        # Атрибут/текст
-        m = re.search(r'aria-label="([\d\s\u00A0,\.]+)\s+просмотр', html, re.IGNORECASE)
-        if m: return parse_int(m.group(1))
-        m = re.search(r'(?:Просмотров|просмотров|views)[^\d]{0,12}([\d\s\u00A0,\.]+)', html, re.IGNORECASE)
-        if m: return parse_int(m.group(1))
+        # "viewCount":"12 345" | "views":"12.3K"
+        m = re.search(r'"viewCount"\s*:\s*"([^"]+)"', html)
+        if m:
+            v = parse_km(m.group(1))
+            if v is not None: return v
+        m = re.search(r'"views"\s*:\s*"([^"]+)"', html)
+        if m:
+            v = parse_km(m.group(1))
+            if v is not None: return v
+
+        # 3) Объекты mvData / mv_data и пр.
+        # ... "mvData": { "views": 12345 } ...
+        m = re.search(r'"mvData"\s*:\s*\{[^}]*?"views"\s*:\s*([0-9]{1,12})', html, re.DOTALL)
+        if m: return int(m.group(1))
+        m = re.search(r'"mv_data"\s*:\s*\{[^}]*?"views"\s*:\s*([0-9]{1,12})', html, re.DOTALL)
+        if m: return int(m.group(1))
+
+        # 4) Атрибуты / элементы верстки
+        # aria-label="12 345 просмотров"
+        m = re.search(r'aria-label="([^"]+?)"', html, re.IGNORECASE)
+        if m and ("просмотр" in m.group(1).lower() or "views" in m.group(1).lower()):
+            v = parse_km(m.group(1))
+            if v is None:
+                # вытащим чисто цифру из aria-label
+                m2 = re.search(r'([\d\s\u00A0,\.]+[KkMm]?)', m.group(1))
+                if m2:
+                    v = parse_km(m2.group(1))
+            if v is not None:
+                return v
+
+        # data-views="12345"
+        m = re.search(r'data-views\s*=\s*"([0-9]{1,12})"', html)
+        if m: return int(m.group(1))
+
+        # class="mv_views">12 345<
+        m = re.search(r'class="[^"]*mv[_-]?views[^"]*"\s*[^>]*>\s*([\d\s\u00A0,\.KkMm]+)\s*<', html)
+        if m:
+            v = parse_km(m.group(1))
+            if v is not None: return v
+
+        # 5) Текстовые варианты по всей странице
+        m = re.search(r'(?:Просмотров|просмотров|Views|views)[^\dKkMm]{0,12}([\d\s\u00A0,\.KkMm]+)', html)
+        if m:
+            v = parse_km(m.group(1))
+            if v is not None: return v
+
         return None
 
+    # Попробуем сам URL
     try:
         html = http_get(url)
         v = try_parse(html)
-        if v is not None: return v
+        if v is not None:
+            return v
     except Exception:
         pass
+
+    # Если это vkvideo.ru — попробуем эквиваленты на vk.com + m.vk.com
+    alt_urls = []
     try:
-        m_url = url
-        if "://m.vk.com/" not in url and "://vkvideo.ru/" not in url:
-            m_url = url.replace("://vk.com/", "://m.vk.com/")
-        html = http_get(m_url)
-        v = try_parse(html)
-        if v is not None: return v
+        low = url.lower()
+        if "vkvideo.ru" in low:
+            # Пример: https://vkvideo.ru/video-48064554_456242034
+            m = re.search(r'/video([-\d_]+)', url)
+            if m:
+                tail = m.group(1)  # "-48064554_456242034"
+                alt_urls.append(f"https://vk.com/video{tail}")
+                alt_urls.append(f"https://m.vk.com/video{tail}")
     except Exception:
         pass
+
+    # Ещё попробуем мобильную версию для обычного vk.com
+    if "vk.com" in url and "m.vk.com" not in url:
+        alt_urls.append(url.replace("://vk.com/", "://m.vk.com/"))
+
+    # Обойти альтернативы
+    for u2 in alt_urls:
+        try:
+            html = http_get(u2)
+            v = try_parse(html)
+            if v is not None:
+                return v
+        except Exception:
+            continue
+
     return None
+
 
 # ---- Telegram (t.me)
 def fetch_views_telegram(url: str):

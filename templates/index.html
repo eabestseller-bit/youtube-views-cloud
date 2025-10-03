@@ -10,12 +10,13 @@
     .container { max-width: 900px; margin: 0 auto; }
     table { width: 100%; }
     .error { background: #ffe9e9; padding: 10px 14px; border-radius: 8px; color: #900; }
+    .note { color:#666; font-size:14px; margin-top:8px; }
   </style>
 </head>
 <body>
   <main class="container">
-    <h1>Social Views Checker (YouTube + OK.ru + RuTube)</h1>
-    <p>Вставьте ссылки (по одной в строке). Поддерживаются YouTube, OK.ru, RuTube, Dzen.</p>
+    <h1>Social Views Checker</h1>
+    <p>Вставьте ссылки (по одной в строке). Поддерживается: YouTube, OK.ru, RuTube, Dzen, VK, Telegram.</p>
 
     {% if error %}
       <div class="error">Ошибка: {{ error }}</div>
@@ -23,11 +24,16 @@
 
     <form method="post">
       <label for="links">Ссылки:</label>
-      <textarea id="links" name="links" placeholder="https://youtu.be/g_Y_dNkMLFM
+      <textarea id="links" name="links" placeholder="Примеры:
+https://youtu.be/g_Y_dNkMLFM
 https://ok.ru/video/1234567890123
 https://rutube.ru/video/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/
-https://dzen.ru/video/watch/XXXXXXXXXXXX">{{ links }}</textarea>
+https://dzen.ru/video/watch/XXXXXXXXXXXX
+https://vk.com/video-12345_67890
+https://vkvideo.ru/video-123456789
+https://t.me/somechannel/1234">{{ links }}</textarea>
       <button type="submit">Показать просмотры</button>
+      <p class="note">Совет: для Dzen лучше вставлять ссылку без хвостов (?share_to=...). Первый запрос может занимать 2–6 сек — запускается браузер.</p>
     </form>
 
     {% if rows %}

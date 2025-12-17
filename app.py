@@ -1,104 +1,70 @@
-from flask import Flask, request, jsonify, render_template_string
+import os
+import re
 import requests
-from bs4 import BeautifulSoup
+from flask import Flask, request, render_template_string
 
 app = Flask(__name__)
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-                  "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 "
-                  "Mobile/15E148 Safari/604.1"
-}
+VK_TOKEN = os.environ.get("VK_TOKEN")
+VK_API = "https://api.vk.com/method"
+VK_VERSION = "5.199"
 
-
-def normalize_vk_url(url: str) -> str:
-    if "vk.com" in url and "m.vk.com" not in url:
-        return url.replace("vk.com", "m.vk.com")
-    return url
-
-
-def extract_views(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Ищем любые упоминания просмотров
-    for tag in soup.find_all(["div", "span"]):
-        text = tag.get_text(strip=True)
-        if "просмотр" in text:
-            return text
-
-    return None
-
-
-HTML_PAGE = """
+HTML = """
 <!doctype html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <title>VK Views</title>
-    <style>
-        body { font-family: Arial, sans-serif; background:#f4f4f4; }
-        .box { max-width:500px; margin:60px auto; background:#fff;
-               padding:20px; border-radius:8px; box-shadow:0 0 10px rgba(0,0,0,.1);}
-        input, button { width:100%; padding:10px; margin-top:10px; }
-        button { background:#4a76a8; color:white; border:none; cursor:pointer; }
-        .result { margin-top:15px; font-size:18px; }
-    </style>
-</head>
-<body>
-<div class="box">
-    <h2>VK — количество просмотров</h2>
-    <form method="post">
-        <input name="url" placeholder="Вставьте ссылку VK" required>
-        <button type="submit">Проверить</button>
-    </form>
-    {% if result %}
-        <div class="result">{{ result }}</div>
-    {% endif %}
-</div>
-</body>
-</html>
+<title>VK Views Checker</title>
+<h2>VK просмотры</h2>
+<form method="post">
+  <input name="url" style="width:400px" placeholder="Ссылка на пост / видео / клип VK" required>
+  <button>Проверить</button>
+</form>
+{% if error %}<p style="color:red">{{ error }}</p>{% endif %}
+{% if views is not none %}<h3>Просмотры: {{ views }}</h3>{% endif %}
 """
 
+def get_post_views(owner_id, post_id):
+    r = requests.get(f"{VK_API}/wall.getById", params={
+        "posts": f"{owner_id}_{post_id}",
+        "access_token": VK_TOKEN,
+        "v": VK_VERSION
+    }).json()
+    try:
+        return r["response"][0]["views"]["count"]
+    except:
+        return None
+
+def get_video_views(owner_id, video_id):
+    r = requests.get(f"{VK_API}/video.get", params={
+        "videos": f"{owner_id}_{video_id}",
+        "access_token": VK_TOKEN,
+        "v": VK_VERSION
+    }).json()
+    try:
+        return r["response"]["items"][0]["views"]
+    except:
+        return None
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    result = None
+    views = None
+    error = None
 
     if request.method == "POST":
-        url = request.form.get("url", "").strip()
-        if url:
-            url = normalize_vk_url(url)
-            try:
-                r = requests.get(url, headers=HEADERS, timeout=10)
-                views = extract_views(r.text)
-                if views:
-                    result = f"Просмотры: {views}"
-                else:
-                    result = "❌ Не удалось определить количество просмотров"
-            except Exception as e:
-                result = f"Ошибка: {e}"
+        url = request.form["url"].strip()
 
-    return render_template_string(HTML_PAGE, result=result)
+        post = re.search(r"wall(-?\d+)_(\d+)", url)
+        video = re.search(r"video(-?\d+)_(\d+)", url)
 
-
-@app.route("/api")
-def api():
-    url = request.args.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "URL не передан"}), 400
-
-    url = normalize_vk_url(url)
-
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        views = extract_views(r.text)
-        if views:
-            return jsonify({"views": views})
+        if post:
+            views = get_post_views(post.group(1), post.group(2))
+        elif video:
+            views = get_video_views(video.group(1), video.group(2))
         else:
-            return jsonify({"error": "Просмотры не найдены"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+            error = "Ссылка не распознана"
 
+        if views is None and not error:
+            error = "Не удалось получить просмотры"
+
+    return render_template_string(HTML, views=views, error=error)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run()

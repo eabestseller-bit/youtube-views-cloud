@@ -5,128 +5,143 @@ from flask import Flask, request, render_template_string
 
 app = Flask(__name__)
 
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
+VK_TOKEN = os.environ.get("VK_TOKEN")
+VK_API = "https://api.vk.com/method"
+VK_VERSION = "5.199"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
 
 HTML = """
 <!doctype html>
-<title>Views Checker</title>
+<title>Social Views Checker</title>
 <h2>Проверка просмотров</h2>
-
 <form method="post">
-  <input name="url" style="width:600px" placeholder="Вставьте ссылку" required>
+  <input name="url" style="width:500px" placeholder="Вставьте ссылку" required>
   <button>Проверить</button>
 </form>
-
-{% if result %}
-  <h3>Результат:</h3>
-  <p>{{ result }}</p>
-{% endif %}
+{% if error %}<p style="color:red">{{ error }}</p>{% endif %}
+{% if result %}<h3>{{ result }}</h3>{% endif %}
 """
 
-# ---------- YouTube ----------
-
-def get_youtube_views(video_id):
-    url = "https://www.googleapis.com/youtube/v3/videos"
-    params = {
-        "part": "statistics",
-        "id": video_id,
-        "key": YOUTUBE_API_KEY
-    }
-    r = requests.get(url, params=params).json()
+# ---------- VK ----------
+def vk_post_views(owner_id, post_id):
+    r = requests.get(f"{VK_API}/wall.getById", params={
+        "posts": f"{owner_id}_{post_id}",
+        "access_token": VK_TOKEN,
+        "v": VK_VERSION
+    }).json()
     try:
-        return r["items"][0]["statistics"]["viewCount"]
+        return r["response"][0]["views"]["count"]
     except:
         return None
 
-# ---------- Telegram ----------
-
-def get_telegram_views(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=headers)
-    html = r.text
-    m = re.search(r'"views":\s*"([\d\s]+)"', html)
-    if m:
-        return m.group(1).replace(" ", "")
-    return None
+def vk_video_views(owner_id, video_id):
+    r = requests.get(f"{VK_API}/video.get", params={
+        "videos": f"{owner_id}_{video_id}",
+        "access_token": VK_TOKEN,
+        "v": VK_VERSION
+    }).json()
+    try:
+        return r["response"]["items"][0]["views"]
+    except:
+        return None
 
 # ---------- OK ----------
+def ok_views(url):
+    r = requests.get(url, headers=HEADERS, timeout=15)
+    html = r.text
 
-def get_ok_views(url):
-    oembed = "https://connect.ok.ru/oembed"
-    r = requests.get(oembed, params={"url": url}).json()
-    try:
-        return r["like_count"]
-    except:
-        return None
+    for pattern in [
+        r'"viewsCount"\s*:\s*(\d+)',
+        r'"viewCount"\s*:\s*"([\d\s]+)"',
+        r'Просмотров[^0-9]*([\d\s]+)'
+    ]:
+        m = re.search(pattern, html)
+        if m:
+            return int(m.group(1).replace(" ", ""))
+    return None
+
+# ---------- YouTube ----------
+def youtube_views(url):
+    r = requests.get(
+        "https://www.youtube.com/oembed",
+        params={"url": url, "format": "json"},
+        timeout=10
+    )
+    if r.status_code == 200:
+        data = r.json()
+        return data.get("view_count")
+    return None
 
 # ---------- RuTube ----------
-
-def get_rutube_views(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=headers)
+def rutube_views(url):
+    r = requests.get(url, headers=HEADERS, timeout=15)
     html = r.text
-    m = re.search(r'"viewsCount":(\d+)', html)
-    if m:
-        return m.group(1)
-    return None
+    m = re.search(r'"views"\s*:\s*(\d+)', html)
+    return int(m.group(1)) if m else None
+
+# ---------- Telegram ----------
+def telegram_views(url):
+    r = requests.get(url, headers=HEADERS, timeout=15)
+    html = r.text
+    m = re.search(r'class="tgme_widget_message_views">([\d\s]+)', html)
+    return int(m.group(1).replace(" ", "")) if m else None
 
 # ---------- Dzen ----------
-
-def get_dzen_views(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=headers)
+def dzen_views(url):
+    r = requests.get(url, headers=HEADERS, timeout=15)
     html = r.text
-    m = re.search(r'"viewsCount":(\d+)', html)
-    if m:
-        return m.group(1)
-    return None
+    m = re.search(r'Просмотров[^0-9]*([\d\s]+)', html)
+    return int(m.group(1).replace(" ", "")) if m else None
 
-# ---------- MAIN ----------
-
+# ---------- ROUTE ----------
 @app.route("/", methods=["GET", "POST"])
 def index():
     result = None
+    error = None
 
     if request.method == "POST":
         url = request.form["url"].strip()
 
-        # VK
-        if "vk.com" in url:
-            result = "VK не предоставляет данные о просмотрах через API"
+        try:
+            if "vk.com" in url:
+                if "wall" in url:
+                    m = re.search(r"wall(-?\d+)_(\d+)", url)
+                    result = vk_post_views(m.group(1), m.group(2)) if m else None
+                elif "video" in url:
+                    m = re.search(r"video(-?\d+)_(\d+)", url)
+                    result = vk_video_views(m.group(1), m.group(2)) if m else None
 
-        # YouTube
-        elif "youtube.com" in url or "youtu.be" in url:
-            yt = re.search(r"(v=|youtu\.be/)([a-zA-Z0-9_-]{11})", url)
-            if yt:
-                views = get_youtube_views(yt.group(2))
-                result = f"YouTube просмотры: {views}" if views else "YouTube: просмотры недоступны"
+            elif "ok.ru" in url:
+                result = ok_views(url)
+
+            elif "youtube.com" in url or "youtu.be" in url:
+                result = youtube_views(url)
+
+            elif "rutube.ru" in url:
+                result = rutube_views(url)
+
+            elif "t.me" in url:
+                result = telegram_views(url)
+
+            elif "dzen.ru" in url:
+                result = dzen_views(url)
+
             else:
-                result = "Некорректная ссылка YouTube"
+                error = "Платформа не поддерживается"
 
-        # Telegram
-        elif "t.me" in url:
-            views = get_telegram_views(url)
-            result = f"Telegram просмотры: {views}" if views else "Telegram: просмотры недоступны"
+            if result is None and not error:
+                error = "Не удалось определить количество просмотров"
 
-        # OK
-        elif "ok.ru" in url:
-            views = get_ok_views(url)
-            result = f"OK просмотры: {views}" if views else "OK: просмотры недоступны"
+            if result is not None:
+                result = f"Просмотры: {result}"
 
-        # RuTube
-        elif "rutube.ru" in url:
-            views = get_rutube_views(url)
-            result = f"RuTube просмотры: {views}" if views else "RuTube: просмотры недоступны"
+        except Exception as e:
+            error = f"Ошибка: {e}"
 
-        # Dzen
-        elif "dzen.ru" in url or "zen.yandex.ru" in url:
-            views = get_dzen_views(url)
-            result = f"Яндекс Дзен просмотры: {views}" if views else "Дзен: просмотры недоступны"
-
-        else:
-            result = "Платформа не распознана"
-
-    return render_template_string(HTML, result=result)
+    return render_template_string(HTML, result=result, error=error)
 
 if __name__ == "__main__":
     app.run()

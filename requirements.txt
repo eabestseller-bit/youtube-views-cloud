@@ -1,3 +1,4 @@
 flask
 requests
 playwright==1.41.2
+greenlet==3.0.3

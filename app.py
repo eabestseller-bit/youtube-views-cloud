@@ -1,74 +1,108 @@
 import os
 import re
+import json
 import requests
 from flask import Flask, request, render_template_string
-from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
 
+# ================= VK =================
 VK_TOKEN = os.environ.get("VK_TOKEN")
 VK_API = "https://api.vk.com/method"
 VK_VERSION = "5.199"
 
+# ================= HTML =================
 HTML = """
 <!doctype html>
-<title>Просмотры</title>
+<title>Views Checker</title>
 <h2>Просмотры по ссылке</h2>
 <form method="post">
-  <input name="url" style="width:500px" placeholder="Вставь ссылку VK / OK / YouTube" required>
+  <input name="url" style="width:600px" placeholder="Вставь ссылку (VK / OK / YouTube)" required>
   <button>Проверить</button>
 </form>
-{% if error %}<p style="color:red">{{ error }}</p>{% endif %}
-{% if views is not none %}<h3>Просмотры: {{ views }}</h3>{% endif %}
+
+{% if error %}
+<p style="color:red">Ошибка: {{ error }}</p>
+{% endif %}
+
+{% if views is not none %}
+<h3>Просмотры: {{ views }}</h3>
+{% endif %}
 """
 
-# ---------- VK ----------
-def vk_post_views(owner_id, post_id):
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+
+# ================= VK =================
+def get_vk_post_views(owner_id, post_id):
     r = requests.get(f"{VK_API}/wall.getById", params={
         "posts": f"{owner_id}_{post_id}",
         "access_token": VK_TOKEN,
         "v": VK_VERSION
     }).json()
-    return r.get("response", [{}])[0].get("views", {}).get("count")
+    try:
+        return r["response"][0]["views"]["count"]
+    except Exception:
+        return None
 
-def vk_video_views(owner_id, video_id):
+def get_vk_video_views(owner_id, video_id):
     r = requests.get(f"{VK_API}/video.get", params={
         "videos": f"{owner_id}_{video_id}",
         "access_token": VK_TOKEN,
         "v": VK_VERSION
     }).json()
-    items = r.get("response", {}).get("items", [])
-    return items[0].get("views") if items else None
-
-# ---------- YouTube ----------
-def youtube_views(url):
-    html = requests.get(url).text
-    m = re.search(r'"viewCount":"(\d+)"', html)
-    return int(m.group(1)) if m else None
-
-# ---------- OK (Playwright) ----------
-def ok_video_views(url):
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url, timeout=60000)
-
-        page.wait_for_timeout(5000)
-
-        content = page.content()
-        browser.close()
-
-        m = re.search(r'"viewCount":(\d+)', content)
-        if m:
-            return int(m.group(1))
-
-        m = re.search(r'Просмотров[:\s]+([\d\s]+)', content)
-        if m:
-            return int(m.group(1).replace(" ", ""))
-
+    try:
+        return r["response"]["items"][0]["views"]
+    except Exception:
         return None
 
-# ---------- ROUTE ----------
+# ================= YOUTUBE =================
+def get_youtube_views(url):
+    try:
+        oembed = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": url, "format": "json"},
+            headers=HEADERS,
+            timeout=10
+        )
+        if oembed.status_code != 200:
+            return None
+
+        html = requests.get(url, headers=HEADERS, timeout=10).text
+        match = re.search(r'"viewCount":"(\d+)"', html)
+        if match:
+            return int(match.group(1))
+    except Exception:
+        return None
+
+    return None
+
+# ================= OK =================
+def get_ok_views(url):
+    try:
+        html = requests.get(url, headers=HEADERS, timeout=10).text
+
+        # способ, который работал раньше
+        match = re.search(r'"viewsCount"\s*:\s*(\d+)', html)
+        if match:
+            return int(match.group(1))
+
+        # запасной вариант
+        match = re.search(r'"videoViews"\s*:\s*(\d+)', html)
+        if match:
+            return int(match.group(1))
+
+    except Exception:
+        return None
+
+    return None
+
+# ================= ROUTE =================
 @app.route("/", methods=["GET", "POST"])
 def index():
     views = None
@@ -77,34 +111,29 @@ def index():
     if request.method == "POST":
         url = request.form["url"].strip()
 
-        try:
-            if "vk.com" in url:
-                post = re.search(r"wall(-?\d+)_(\d+)", url)
-                video = re.search(r"video(-?\d+)_(\d+)", url)
+        # VK post
+        post = re.search(r"wall(-?\d+)_(\d+)", url)
+        video = re.search(r"video(-?\d+)_(\d+)", url)
 
-                if post:
-                    views = vk_post_views(post.group(1), post.group(2))
-                elif video:
-                    views = vk_video_views(video.group(1), video.group(2))
-                else:
-                    error = "Ссылка VK не распознана"
+        if post:
+            views = get_vk_post_views(post.group(1), post.group(2))
 
-            elif "ok.ru" in url:
-                views = ok_video_views(url)
+        elif video:
+            views = get_vk_video_views(video.group(1), video.group(2))
 
-            elif "youtube.com" in url or "youtu.be" in url:
-                views = youtube_views(url)
+        elif "ok.ru" in url:
+            views = get_ok_views(url)
 
-            else:
-                error = "Платформа не поддерживается"
+        elif "youtube.com" in url or "youtu.be" in url:
+            views = get_youtube_views(url)
 
-            if views is None and not error:
-                error = "Не удалось определить количество просмотров"
+        else:
+            error = "Ссылка не распознана"
 
-        except Exception as e:
-            error = f"Ошибка: {str(e)}"
+        if views is None and not error:
+            error = "Не удалось определить количество просмотров"
 
     return render_template_string(HTML, views=views, error=error)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run()

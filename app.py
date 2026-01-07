@@ -5,66 +5,84 @@ from flask import Flask, request, render_template_string
 
 app = Flask(__name__)
 
-VK_TOKEN = os.environ.get("VK_TOKEN")
-VK_API = "https://api.vk.com/method"
-VK_VERSION = "5.199"
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 
 HTML = """
 <!doctype html>
-<title>VK Views Checker</title>
-<h2>VK просмотры</h2>
+<title>Views Checker</title>
+<h2>Проверка просмотров</h2>
+
 <form method="post">
-  <input name="url" style="width:400px" placeholder="Ссылка на пост / видео / клип VK" required>
+  <input name="url" style="width:500px" placeholder="Вставьте ссылку" required>
   <button>Проверить</button>
 </form>
-{% if error %}<p style="color:red">{{ error }}</p>{% endif %}
-{% if views is not none %}<h3>Просмотры: {{ views }}</h3>{% endif %}
+
+{% if result %}
+  <h3>Результат:</h3>
+  <p>{{ result }}</p>
+{% endif %}
 """
 
-def get_post_views(owner_id, post_id):
-    r = requests.get(f"{VK_API}/wall.getById", params={
-        "posts": f"{owner_id}_{post_id}",
-        "access_token": VK_TOKEN,
-        "v": VK_VERSION
-    }).json()
+# ---------- YouTube ----------
+
+def get_youtube_views(video_id):
+    url = "https://www.googleapis.com/youtube/v3/videos"
+    params = {
+        "part": "statistics",
+        "id": video_id,
+        "key": YOUTUBE_API_KEY
+    }
+    r = requests.get(url, params=params).json()
     try:
-        return r["response"][0]["views"]["count"]
+        return r["items"][0]["statistics"]["viewCount"]
     except:
         return None
 
-def get_video_views(owner_id, video_id):
-    r = requests.get(f"{VK_API}/video.get", params={
-        "videos": f"{owner_id}_{video_id}",
-        "access_token": VK_TOKEN,
-        "v": VK_VERSION
-    }).json()
-    try:
-        return r["response"]["items"][0]["views"]
-    except:
-        return None
+# ---------- MAIN ----------
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    views = None
-    error = None
+    result = None
 
     if request.method == "POST":
         url = request.form["url"].strip()
 
-        post = re.search(r"wall(-?\d+)_(\d+)", url)
-        video = re.search(r"video(-?\d+)_(\d+)", url)
+        # VK
+        if "vk.com" in url:
+            result = "VK не предоставляет данные о просмотрах через API"
 
-        if post:
-            views = get_post_views(post.group(1), post.group(2))
-        elif video:
-            views = get_video_views(video.group(1), video.group(2))
+        # YouTube
+        elif "youtube.com" in url or "youtu.be" in url:
+            yt = re.search(r"(v=|youtu\.be/)([a-zA-Z0-9_-]{11})", url)
+            if yt:
+                views = get_youtube_views(yt.group(2))
+                if views:
+                    result = f"YouTube просмотры: {views}"
+                else:
+                    result = "Не удалось получить просмотры YouTube"
+            else:
+                result = "Не удалось распознать ссылку YouTube"
+
+        # Telegram
+        elif "t.me" in url:
+            result = "Telegram: просмотры доступны только через парсинг (в разработке)"
+
+        # OK
+        elif "ok.ru" in url:
+            result = "OK: API требует отдельной авторизации (в разработке)"
+
+        # RuTube
+        elif "rutube.ru" in url:
+            result = "RuTube: API ограничен (в разработке)"
+
+        # Dzen
+        elif "dzen.ru" in url or "zen.yandex.ru" in url:
+            result = "Яндекс Дзен: API недоступен публично (в разработке)"
+
         else:
-            error = "Ссылка не распознана"
+            result = "Платформа не распознана"
 
-        if views is None and not error:
-            error = "Не удалось получить просмотры"
-
-    return render_template_string(HTML, views=views, error=error)
+    return render_template_string(HTML, result=result)
 
 if __name__ == "__main__":
     app.run()

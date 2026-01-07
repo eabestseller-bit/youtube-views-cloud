@@ -13,7 +13,7 @@ HTML = """
 <h2>Проверка просмотров</h2>
 
 <form method="post">
-  <input name="url" style="width:500px" placeholder="Вставьте ссылку" required>
+  <input name="url" style="width:600px" placeholder="Вставьте ссылку" required>
   <button>Проверить</button>
 </form>
 
@@ -38,6 +38,49 @@ def get_youtube_views(video_id):
     except:
         return None
 
+# ---------- Telegram ----------
+
+def get_telegram_views(url):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers)
+    html = r.text
+    m = re.search(r'"views":\s*"([\d\s]+)"', html)
+    if m:
+        return m.group(1).replace(" ", "")
+    return None
+
+# ---------- OK ----------
+
+def get_ok_views(url):
+    oembed = "https://connect.ok.ru/oembed"
+    r = requests.get(oembed, params={"url": url}).json()
+    try:
+        return r["like_count"]
+    except:
+        return None
+
+# ---------- RuTube ----------
+
+def get_rutube_views(url):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers)
+    html = r.text
+    m = re.search(r'"viewsCount":(\d+)', html)
+    if m:
+        return m.group(1)
+    return None
+
+# ---------- Dzen ----------
+
+def get_dzen_views(url):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers)
+    html = r.text
+    m = re.search(r'"viewsCount":(\d+)', html)
+    if m:
+        return m.group(1)
+    return None
+
 # ---------- MAIN ----------
 
 @app.route("/", methods=["GET", "POST"])
@@ -56,28 +99,29 @@ def index():
             yt = re.search(r"(v=|youtu\.be/)([a-zA-Z0-9_-]{11})", url)
             if yt:
                 views = get_youtube_views(yt.group(2))
-                if views:
-                    result = f"YouTube просмотры: {views}"
-                else:
-                    result = "Не удалось получить просмотры YouTube"
+                result = f"YouTube просмотры: {views}" if views else "YouTube: просмотры недоступны"
             else:
-                result = "Не удалось распознать ссылку YouTube"
+                result = "Некорректная ссылка YouTube"
 
         # Telegram
         elif "t.me" in url:
-            result = "Telegram: просмотры доступны только через парсинг (в разработке)"
+            views = get_telegram_views(url)
+            result = f"Telegram просмотры: {views}" if views else "Telegram: просмотры недоступны"
 
         # OK
         elif "ok.ru" in url:
-            result = "OK: API требует отдельной авторизации (в разработке)"
+            views = get_ok_views(url)
+            result = f"OK просмотры: {views}" if views else "OK: просмотры недоступны"
 
         # RuTube
         elif "rutube.ru" in url:
-            result = "RuTube: API ограничен (в разработке)"
+            views = get_rutube_views(url)
+            result = f"RuTube просмотры: {views}" if views else "RuTube: просмотры недоступны"
 
         # Dzen
         elif "dzen.ru" in url or "zen.yandex.ru" in url:
-            result = "Яндекс Дзен: API недоступен публично (в разработке)"
+            views = get_dzen_views(url)
+            result = f"Яндекс Дзен просмотры: {views}" if views else "Дзен: просмотры недоступны"
 
         else:
             result = "Платформа не распознана"

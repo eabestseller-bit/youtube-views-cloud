@@ -6,136 +6,173 @@ from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
-HTML = """
-<!doctype html>
-<title>Social Views Checker</title>
-<h2>Проверка просмотров</h2>
-<form method="post">
-  <input name="url" style="width:450px" placeholder="VK / OK / YouTube" required>
-  <button type="submit">Проверить</button>
-</form>
-{% if error %}
-  <p style="color:red">{{ error }}</p>
-{% endif %}
-{% if views is not none %}
-  <h3>Просмотры: {{ views }}</h3>
-{% endif %}
-"""
-
-### ---------- VK (API) ----------
+### VK ###
 VK_TOKEN = os.environ.get("VK_TOKEN")
 VK_API = "https://api.vk.com/method"
 VK_VERSION = "5.199"
 
-def get_vk_views(url):
-    post = re.search(r"wall(-?\d+)_(\d+)", url)
-    video = re.search(r"video(-?\d+)_(\d+)", url)
+### ОДНОКЛАССНИКИ COOKIE ###
+OK_COOKIE = os.environ.get("OK_COOKIE")  # вставь свои куки в Render как OK_COOKIE
 
-    if post:
-        owner, post_id = post.group(1), post.group(2)
-        r = requests.get(f"{VK_API}/wall.getById", params={
-            "posts": f"{owner}_{post_id}",
-            "access_token": VK_TOKEN,
-            "v": VK_VERSION
-        }).json()
-        try:
-            return r["response"][0]["views"]["count"]
-        except:
-            return None
+HTML = """
+<!doctype html>
+<title>Views Checker</title>
+<h2>Проверка просмотров</h2>
 
-    if video:
-        owner, vid = video.group(1), video.group(2)
-        r = requests.get(f"{VK_API}/video.get", params={
-            "videos": f"{owner}_{vid}",
-            "access_token": VK_TOKEN,
-            "v": VK_VERSION
-        }).json()
-        try:
-            return r["response"]["items"][0]["views"]
-        except:
-            return None
+<form method="post">
+  <input name="url" style="width:450px" placeholder="Ссылка на ОК / YouTube / VK / RuTube / Дзен / Telegram" required>
+  <button>Проверить</button>
+</form>
+
+{% if error %}<p style="color:red">{{ error }}</p>{% endif %}
+{% if views is not none %}<h3>Просмотры: {{ views }}</h3>{% endif %}
+"""
+
+################ VK ################
+
+def get_vk_post(owner_id, post_id):
+    r = requests.get(f"{VK_API}/wall.getById", params={
+        "posts": f"{owner_id}_{post_id}",
+        "access_token": VK_TOKEN,
+        "v": VK_VERSION
+    }).json()
+    try:
+        return r["response"][0]["views"]["count"]
+    except:
+        return None
+
+def get_vk_video(owner_id, video_id):
+    r = requests.get(f"{VK_API}/video.get", params={
+        "videos": f"{owner_id}_{video_id}",
+        "access_token": VK_TOKEN,
+        "v": VK_VERSION
+    }).json()
+    try:
+        return r["response"]["items"][0]["views"]
+    except:
+        return None
+
+################ YouTube ################
+
+def get_youtube(url):
+    yt_id = None
+    if "shorts" in url:
+        m = re.search(r"shorts/([A-Za-z0-9_-]{5,})", url)
+        if m: yt_id = m.group(1)
+    else:
+        m = re.search(r"v=([A-Za-z0-9_-]{5,})", url)
+        if m: yt_id = m.group(1)
+
+    if not yt_id:
+        return None
+
+    api = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={yt_id}&format=json"
+    r = requests.get(api)
+    if r.status_code != 200:
+        return None
+
+    # к сожалению эта точка не даёт просмотры — только проверку id
+    # вернем None чтобы функция ниже не сломалась
     return None
 
+################ Одноклассники (через HTML + cookie) ################
 
-### ---------- OK.RU (c твоими cookie) ----------
+def get_ok(url):
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17 Safari/605.1.15",
+            "Referer": "https://ok.ru/",
+            "Accept-Language": "ru-RU,ru;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15",
-    "Accept-Language": "ru-RU,ru",
-    "Referer": "https://m.ok.ru",
-    "Cookie": "__last_online=1767870720355; DCAPS=dpr%5E2%7Cvw%5E1440%7Cvh%5E320%7Co%5El%7Csw%5E1440%7C; tmr_detect=0%7C1767877543966; community-lang=ru; tmr_lvid=e1a31c5b627450fe4b1f73b29cfd0904; tmr_lvidTS=1767790191089; domain_sid=j68SLwIccGbZuk_RwoV42%3A1767877541723; cookieChoice=\"PRIVACY,1,2,3\""
-}
+        cookies = {}
+        if OK_COOKIE:
+            for part in OK_COOKIE.split(";"):
+                if "=" in part:
+                    k,v = part.strip().split("=",1)
+                    cookies[k] = v
 
-def extract_ok(html_text):
-    # JSON patterns
-    for pat in [
-        r'"viewCount"\s*:\s*([0-9]+)',
-        r'"viewsCount"\s*:\s*([0-9]+)',
-        r'"count"\s*:\s*([0-9]+)'
-    ]:
-        m = re.search(pat, html_text)
-        if m:
-            return int(m.group(1))
+        r = requests.get(url, headers=headers, cookies=cookies, timeout=10)
+        if r.status_code != 200:
+            return None
 
-    soup = BeautifulSoup(html_text, "lxml")
+        soup = BeautifulSoup(r.text, "lxml")
 
-    # vp_cnt inside html
-    span = soup.find("span", class_="vp_cnt")
-    if span:
-        digits = re.sub(r'\D+', '', span.get_text(strip=True))
-        if digits:
+        # ищем просмотры в <span class="video-view-count">1234</span>
+        el = soup.find("span", {"class": "video-view-count"})
+        if el:
+            digits = re.sub(r"\D", "", el.text)
             return int(digits)
 
-    # Просмотров: ### (fallback)
-    m = re.search(r"Просмотров[^0-9]*([0-9\s]+)", html_text)
-    if m:
-        return int(m.group(1).replace(" ", ""))
+        return None
+    except:
+        return None
 
-    return None
+################ RuTube (через HEAD) ################
 
+def get_rutube(url):
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return None
+        m = re.search(r'"viewCount":(\d+)', r.text)
+        if m:
+            return int(m.group(1))
+    except:
+        return None
 
-def get_ok_views(url):
-    candidates = [
-        url,
-        url.replace("://ok.ru", "://m.ok.ru"),
-        url.replace("ok.ru/video/", "ok.ru/videoembed/"),
-        url.replace("ok.ru/video/", "m.ok.ru/video/")
-    ]
+################ Дзен ################
 
-    for u in candidates:
-        try:
-            r = requests.get(u, headers=HEADERS, timeout=10)
-            v = extract_ok(r.text)
-            if v:
-                return v
-        except:
-            pass
+def get_dzen(url):
+    try:
+        r = requests.get(url, timeout=10)
+        m = re.search(r'"viewCount":(\d+)', r.text)
+        if m:
+            return int(m.group(1))
+    except:
+        return None
 
-    return None
+################ Telegram ################
 
+def get_telegram(url):
+    try:
+        r = requests.get(url, timeout=10)
+        m = re.search(r'"views":(\d+)', r.text)
+        if m:
+            return int(m.group(1))
+    except:
+        return None
 
-### ---------- YouTube (disabled) ----------
-def get_youtube_views(url):
-    return None
+################ Flask ################
 
-
-### ---------- Routing ----------
 @app.route("/", methods=["GET", "POST"])
 def index():
     views = None
     error = None
 
     if request.method == "POST":
-        url = request.form.get("url", "").strip()
+        url = request.form["url"].strip()
 
-        if "vk.com" in url or "vkvideo.ru" in url:
-            views = get_vk_views(url)
+        if "vk.com" in url:
+            post = re.search(r"wall(-?\d+)_(\d+)", url)
+            video = re.search(r"video(-?\d+)_(\d+)", url)
+            if post:
+                views = get_vk_post(post.group(1), post.group(2))
+            elif video:
+                views = get_vk_video(video.group(1), video.group(2))
         elif "ok.ru" in url:
-            views = get_ok_views(url)
-        elif "youtu" in url:
-            views = get_youtube_views(url)
+            views = get_ok(url)
+        elif "youtube.com" in url or "youtu.be" in url:
+            views = get_youtube(url)
+        elif "rutube" in url:
+            views = get_rutube(url)
+        elif "dzen.ru" in url:
+            views = get_dzen(url)
+        elif "t.me" in url:
+            views = get_telegram(url)
         else:
-            error = "Сайт пока не поддерживается"
+            error = "Ссылка не распознана"
 
         if views is None and not error:
             error = "Не удалось определить количество просмотров"
@@ -143,4 +180,4 @@ def index():
     return render_template_string(HTML, views=views, error=error)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run()

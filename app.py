@@ -6,14 +6,12 @@ from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
-### ------------------ HTML UI ------------------------
-
 HTML = """
 <!doctype html>
 <title>Social Views Checker</title>
 <h2>Проверка просмотров</h2>
 <form method="post">
-  <input name="url" style="width:450px" placeholder="Вставьте ссылку VK / OK / YouTube" required>
+  <input name="url" style="width:450px" placeholder="VK / OK / YouTube" required>
   <button type="submit">Проверить</button>
 </form>
 {% if error %}
@@ -24,8 +22,7 @@ HTML = """
 {% endif %}
 """
 
-### ---------------- VK через API --------------------
-
+### ---------- VK (через API) ----------
 VK_TOKEN = os.environ.get("VK_TOKEN")
 VK_API = "https://api.vk.com/method"
 VK_VERSION = "5.199"
@@ -57,66 +54,72 @@ def get_vk_views(url):
             return r["response"]["items"][0]["views"]
         except:
             return None
-
     return None
 
-### ---------------- OK.RU через HTML + mobile fallback ---------------
 
-UA = {
-    "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
+### ---------- OK.RU (Усиленный парсер) ----------
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15",
+    "Accept-Language": "ru-RU,ru",
+    "Referer": "https://m.ok.ru",
+    "Cookie": "stid=A=B"
 }
 
-def parse_ok(html_text):
-    # JSON поля
-    m = re.search(r'"viewsCount"\s*:\s*([0-9]+)', html_text)
-    if m: return int(m.group(1))
+def extract_ok(html_text):
+    # JSON варианты
+    for pat in [
+        r'"viewCount"\s*:\s*([0-9]+)',
+        r'"viewsCount"\s*:\s*([0-9]+)',
+        r'"count"\s*:\s*([0-9]+)'
+    ]:
+        m = re.search(pat, html_text)
+        if m:
+            return int(m.group(1))
 
-    m = re.search(r'"viewCount"\s*:\s*([0-9]+)', html_text)
-    if m: return int(m.group(1))
-
-    # html текст
+    # HTML текст
     soup = BeautifulSoup(html_text, "lxml")
+    # vp_cnt — старый вариант
     tag = soup.find("span", class_="vp_cnt")
     if tag:
-        digits = re.sub(r"\D+", "", tag.text)
-        if digits: return int(digits)
+        digits = re.sub(r"\D+", "", tag.get_text(strip=True))
+        if digits:
+            return int(digits)
+
+    # словесный
+    m = re.search(r"Просмотров[^0-9]*([0-9\s]+)", html_text)
+    if m:
+        return int(m.group(1).replace(" ", ""))
 
     return None
 
 def get_ok_views(url):
-    try:
-        # 1 попытка — обычная страница
-        r = requests.get(url, headers=UA, timeout=10)
-        v = parse_ok(r.text)
-        if v: return v
+    candidates = [
+        url,
+        url.replace("://ok.ru", "://m.ok.ru"),
+        url.replace("ok.ru/video/", "ok.ru/videoembed/"),
+        url.replace("ok.ru/video/", "m.ok.ru/video/"),
+    ]
 
-        # 2 попытка — мобильная версия
-        m_url = url.replace("://ok.ru", "://m.ok.ru")
-        r = requests.get(m_url, headers=UA, timeout=10)
-        v = parse_ok(r.text)
-        if v: return v
-
-        # 3 попытка — embed
-        em_url = url.replace("ok.ru/video/", "ok.ru/videoembed/")
-        r = requests.get(em_url, headers=UA, timeout=10)
-        v = parse_ok(r.text)
-        if v: return v
-
-    except Exception as e:
-        print("OK ERROR:", e)
+    for u in candidates:
+        try:
+            r = requests.get(u, headers=HEADERS, timeout=10)
+            v = extract_ok(r.text)
+            if v:
+                return v
+        except Exception as e:
+            print("OK ERROR:", e)
 
     return None
 
-### ---------------- Stub для YouTube (позже включим) ----------------
+
+### ---------- YouTube (пока выключено) ----------
 
 def get_youtube_views(url):
     return None
 
-### ---------------- Controller ----------------------
 
+### ---------- Контроллер ----------
 @app.route("/", methods=["GET", "POST"])
 def index():
     views = None
@@ -142,7 +145,5 @@ def index():
 
     return render_template_string(HTML, views=views, error=error)
 
-
-# prod launch
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)

@@ -22,7 +22,7 @@ HTML = """
 {% endif %}
 """
 
-### ---------- VK (через API) ----------
+### ---------- VK (API) ----------
 VK_TOKEN = os.environ.get("VK_TOKEN")
 VK_API = "https://api.vk.com/method"
 VK_VERSION = "5.199"
@@ -57,17 +57,17 @@ def get_vk_views(url):
     return None
 
 
-### ---------- OK.RU (Усиленный парсер) ----------
+### ---------- OK.RU (c твоими cookie) ----------
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15",
     "Accept-Language": "ru-RU,ru",
     "Referer": "https://m.ok.ru",
-    "Cookie": "stid=A=B"
+    "Cookie": "__last_online=1767870720355; DCAPS=dpr%5E2%7Cvw%5E1440%7Cvh%5E320%7Co%5El%7Csw%5E1440%7C; tmr_detect=0%7C1767877543966; community-lang=ru; tmr_lvid=e1a31c5b627450fe4b1f73b29cfd0904; tmr_lvidTS=1767790191089; domain_sid=j68SLwIccGbZuk_RwoV42%3A1767877541723; cookieChoice=\"PRIVACY,1,2,3\""
 }
 
 def extract_ok(html_text):
-    # JSON варианты
+    # JSON patterns
     for pat in [
         r'"viewCount"\s*:\s*([0-9]+)',
         r'"viewsCount"\s*:\s*([0-9]+)',
@@ -77,28 +77,29 @@ def extract_ok(html_text):
         if m:
             return int(m.group(1))
 
-    # HTML текст
     soup = BeautifulSoup(html_text, "lxml")
-    # vp_cnt — старый вариант
-    tag = soup.find("span", class_="vp_cnt")
-    if tag:
-        digits = re.sub(r"\D+", "", tag.get_text(strip=True))
+
+    # vp_cnt inside html
+    span = soup.find("span", class_="vp_cnt")
+    if span:
+        digits = re.sub(r'\D+', '', span.get_text(strip=True))
         if digits:
             return int(digits)
 
-    # словесный
+    # Просмотров: ### (fallback)
     m = re.search(r"Просмотров[^0-9]*([0-9\s]+)", html_text)
     if m:
         return int(m.group(1).replace(" ", ""))
 
     return None
 
+
 def get_ok_views(url):
     candidates = [
         url,
         url.replace("://ok.ru", "://m.ok.ru"),
         url.replace("ok.ru/video/", "ok.ru/videoembed/"),
-        url.replace("ok.ru/video/", "m.ok.ru/video/"),
+        url.replace("ok.ru/video/", "m.ok.ru/video/")
     ]
 
     for u in candidates:
@@ -107,19 +108,18 @@ def get_ok_views(url):
             v = extract_ok(r.text)
             if v:
                 return v
-        except Exception as e:
-            print("OK ERROR:", e)
+        except:
+            pass
 
     return None
 
 
-### ---------- YouTube (пока выключено) ----------
-
+### ---------- YouTube (disabled) ----------
 def get_youtube_views(url):
     return None
 
 
-### ---------- Контроллер ----------
+### ---------- Routing ----------
 @app.route("/", methods=["GET", "POST"])
 def index():
     views = None
@@ -130,13 +130,10 @@ def index():
 
         if "vk.com" in url or "vkvideo.ru" in url:
             views = get_vk_views(url)
-
         elif "ok.ru" in url:
             views = get_ok_views(url)
-
         elif "youtu" in url:
             views = get_youtube_views(url)
-
         else:
             error = "Сайт пока не поддерживается"
 

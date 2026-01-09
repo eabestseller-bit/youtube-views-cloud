@@ -5,36 +5,32 @@ from flask import Flask, request, render_template_string
 
 app = Flask(__name__)
 
-# ===== API TOKENS =====
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
+# 🔐 токены из настроек Render
 VK_TOKEN = os.environ.get("VK_TOKEN")
+YT_KEY = os.environ.get("YOUTUBE_API_KEY")
 
-# ===== API ENDPOINTS =====
-YOUTUBE_API = "https://www.googleapis.com/youtube/v3/videos"
 VK_API = "https://api.vk.com/method"
 VK_VERSION = "5.199"
+YT_API = "https://www.googleapis.com/youtube/v3/videos"
 
-# ===== HTML =====
 HTML = """
 <!doctype html>
-<title>Просмотры Видео</title>
-<h2>Проверка просмотров</h2>
+<title>VK + YouTube</title>
+<h2>Проверка просмотров VK и YouTube</h2>
 <form method="post">
-  <input name="url" style="width:420px" placeholder="Ссылка YouTube или VK" required>
+  <input name="url" style="width:450px" placeholder="Вставь ссылку на VK или YouTube" required>
   <button>Проверить</button>
 </form>
 {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
-{% if platform %}<p><b>Платформа:</b> {{ platform }}</p>{% endif %}
 {% if views is not none %}<h3>Просмотры: {{ views }}</h3>{% endif %}
 """
 
-# ====== YOUTUBE ======
-
-def get_youtube_id(url):
+# ==================== YOUTUBE ======================
+def extract_youtube_id(url):
     patterns = [
-        r"youtu\.be/([A-Za-z0-9_-]{5,})",
-        r"youtube\.com/watch\?v=([A-Za-z0-9_-]{5,})",
-        r"youtube\.com/shorts/([A-Za-z0-9_-]{5,})"
+        r"v=([A-Za-z0-9_-]{6,})",
+        r"youtu\.be/([A-Za-z0-9_-]{6,})",
+        r"shorts/([A-Za-z0-9_-]{6,})"
     ]
     for p in patterns:
         m = re.search(p, url)
@@ -43,19 +39,18 @@ def get_youtube_id(url):
     return None
 
 def get_youtube_views(video_id):
-    params = {
+    r = requests.get(YT_API, params={
         "id": video_id,
-        "part": "statistics",
-        "key": YOUTUBE_API_KEY
-    }
-    r = requests.get(YOUTUBE_API, params=params).json()
+        "key": YT_KEY,
+        "part": "statistics"
+    }).json()
+
     try:
         return int(r["items"][0]["statistics"]["viewCount"])
     except:
         return None
 
-# ====== VK ======
-
+# ====================== VK =========================
 def get_vk_post_views(owner_id, post_id):
     r = requests.get(f"{VK_API}/wall.getById", params={
         "posts": f"{owner_id}_{post_id}",
@@ -78,44 +73,47 @@ def get_vk_video_views(owner_id, video_id):
     except:
         return None
 
-# ===== ROUTE =====
-
+# ====================== ROUTE ======================
 @app.route("/", methods=["GET", "POST"])
 def index():
     views = None
-    platform = None
     error = None
 
     if request.method == "POST":
         url = request.form["url"].strip()
 
-        # ---------------- YOUTUBE ----------------
-        yt_id = get_youtube_id(url)
-        if yt_id:
-            platform = "YouTube"
-            views = get_youtube_views(yt_id)
+        # YOUTUBE
+        vid = extract_youtube_id(url)
+        if vid:
+            if not YT_KEY:
+                error = "Нет YouTube API ключа"
+            else:
+                views = get_youtube_views(vid)
+            if views is None:
+                error = "Не удалось получить просмотры YouTube"
+            return render_template_string(HTML, views=views, error=error)
 
-        # ---------------- VK ---------------------
-        if views is None:
-            match_post = re.search(r"wall(-?\d+)_(\d+)", url)
-            match_video = re.search(r"video(-?\d+)_(\d+)", url)
-            if match_post:
-                platform = "VK пост"
-                views = get_vk_post_views(match_post.group(1), match_post.group(2))
-            elif match_video:
-                platform = "VK видео"
-                views = get_vk_video_views(match_video.group(1), match_video.group(2))
+        # VK post
+        post = re.search(r"wall(-?\d+)_(\d+)", url)
+        video = re.search(r"video(-?\d+)_(\d+)", url)
 
-        # ---------------- ERRORS ------------------
-        if platform is None:
-            error = "Ссылка не распознана (только YouTube + VK)"
-        elif views is None:
-            error = f"{platform}: не удалось получить просмотры"
+        if not VK_TOKEN:
+            error = "Нет VK токена"
 
-    return render_template_string(HTML,
-                                  views=views,
-                                  error=error,
-                                  platform=platform)
+        elif post:
+            views = get_vk_post_views(post.group(1), post.group(2))
+            if views is None:
+                error = "Не удалось получить просмотры VK поста"
+
+        elif video:
+            views = get_vk_video_views(video.group(1), video.group(2))
+            if views is None:
+                error = "Не удалось получить просмотры VK видео"
+
+        else:
+            error = "Ссылка не распознана"
+
+    return render_template_string(HTML, views=views, error=error)
 
 if __name__ == "__main__":
     app.run()

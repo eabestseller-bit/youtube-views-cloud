@@ -5,75 +5,86 @@ from flask import Flask, request, render_template_string
 
 app = Flask(__name__)
 
-# 🔐 токены из настроек Render
-VK_TOKEN = os.environ.get("VK_TOKEN")
-YT_KEY = os.environ.get("YOUTUBE_API_KEY")
-
-VK_API = "https://api.vk.com/method"
-VK_VERSION = "5.199"
-YT_API = "https://www.googleapis.com/youtube/v3/videos"
+YOUTUBE_KEY = os.environ.get("YOUTUBE_API_KEY")
 
 HTML = """
 <!doctype html>
-<title>VK + YouTube</title>
-<h2>Проверка просмотров VK и YouTube</h2>
+<title>Проверка просмотров</title>
+<h2>Проверка просмотров YouTube / Telegram / RuTube</h2>
 <form method="post">
-  <input name="url" style="width:450px" placeholder="Вставь ссылку на VK или YouTube" required>
+  <input name="url" style="width:400px" placeholder="Вставьте ссылку" required>
   <button>Проверить</button>
 </form>
 {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
 {% if views is not none %}<h3>Просмотры: {{ views }}</h3>{% endif %}
 """
 
-# ==================== YOUTUBE ======================
-def extract_youtube_id(url):
-    patterns = [
-        r"v=([A-Za-z0-9_-]{6,})",
-        r"youtu\.be/([A-Za-z0-9_-]{6,})",
-        r"shorts/([A-Za-z0-9_-]{6,})"
-    ]
-    for p in patterns:
-        m = re.search(p, url)
-        if m:
-            return m.group(1)
+# --------------- YOUTUBE ---------------
+def get_youtube_views(url):
+    yt = re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{6,})", url)
+    if not yt:
+        return None
+
+    video_id = yt.group(1)
+
+    r = requests.get(
+        "https://www.googleapis.com/youtube/v3/videos",
+        params={
+            "id": video_id,
+            "key": YOUTUBE_KEY,
+            "part": "statistics"
+        }
+    ).json()
+
+    try:
+        return r["items"][0]["statistics"]["viewCount"]
+    except:
+        return None
+
+
+# --------------- TELEGRAM ---------------
+def get_telegram_views(url):
+    # Pull post number
+    post = re.search(r"t.me/[^/]+/(\d+)", url)
+    if not post:
+        return None
+
+    try:
+        # Public TG pages include views in og metadata!
+        html = requests.get(url).text
+        match = re.search(r'"views":(\d+)', html)
+        if match:
+            return match.group(1)
+
+        # fallback: search plain text
+        match = re.search(r'views"\s*:\s*(\d+)', html)
+        if match:
+            return match.group(1)
+
+    except:
+        return None
+
     return None
 
-def get_youtube_views(video_id):
-    r = requests.get(YT_API, params={
-        "id": video_id,
-        "key": YT_KEY,
-        "part": "statistics"
-    }).json()
+
+# --------------- RUTUBE ---------------
+def get_rutube_views(url):
+    video = re.search(r"rutube.ru/(?:video|shorts)/([A-Za-z0-9-]+)", url)
+    if not video:
+        return None
+
+    video_id = video.group(1)
+
+    api = f"https://rutube.ru/api/video/{video_id}/?format=json"
 
     try:
-        return int(r["items"][0]["statistics"]["viewCount"])
+        r = requests.get(api).json()
+        return r.get("hit", None)
     except:
         return None
 
-# ====================== VK =========================
-def get_vk_post_views(owner_id, post_id):
-    r = requests.get(f"{VK_API}/wall.getById", params={
-        "posts": f"{owner_id}_{post_id}",
-        "access_token": VK_TOKEN,
-        "v": VK_VERSION
-    }).json()
-    try:
-        return r["response"][0]["views"]["count"]
-    except:
-        return None
 
-def get_vk_video_views(owner_id, video_id):
-    r = requests.get(f"{VK_API}/video.get", params={
-        "videos": f"{owner_id}_{video_id}",
-        "access_token": VK_TOKEN,
-        "v": VK_VERSION
-    }).json()
-    try:
-        return r["response"]["items"][0]["views"]
-    except:
-        return None
-
-# ====================== ROUTE ======================
+# --------------- ROUTER ---------------
 @app.route("/", methods=["GET", "POST"])
 def index():
     views = None
@@ -82,38 +93,20 @@ def index():
     if request.method == "POST":
         url = request.form["url"].strip()
 
-        # YOUTUBE
-        vid = extract_youtube_id(url)
-        if vid:
-            if not YT_KEY:
-                error = "Нет YouTube API ключа"
-            else:
-                views = get_youtube_views(vid)
-            if views is None:
-                error = "Не удалось получить просмотры YouTube"
-            return render_template_string(HTML, views=views, error=error)
-
-        # VK post
-        post = re.search(r"wall(-?\d+)_(\d+)", url)
-        video = re.search(r"video(-?\d+)_(\d+)", url)
-
-        if not VK_TOKEN:
-            error = "Нет VK токена"
-
-        elif post:
-            views = get_vk_post_views(post.group(1), post.group(2))
-            if views is None:
-                error = "Не удалось получить просмотры VK поста"
-
-        elif video:
-            views = get_vk_video_views(video.group(1), video.group(2))
-            if views is None:
-                error = "Не удалось получить просмотры VK видео"
-
+        if "youtu" in url:
+            views = get_youtube_views(url)
+        elif "t.me" in url:
+            views = get_telegram_views(url)
+        elif "rutube.ru" in url:
+            views = get_rutube_views(url)
         else:
-            error = "Ссылка не распознана"
+            error = "Платформа не распознана: поддержка YouTube, Telegram, RuTube"
+
+        if views is None and not error:
+            error = "Не удалось определить просмотры"
 
     return render_template_string(HTML, views=views, error=error)
 
+
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0")

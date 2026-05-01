@@ -1,49 +1,67 @@
 import os
 import re
+import csv
+import io
 import requests
-from flask import Flask, request, render_template_string
+from datetime import date
+from flask import Flask, request, render_template_string, Response
 
 app = Flask(__name__)
-
-VK_TOKEN = os.environ.get("VK_TOKEN")
-VK_API = "https://api.vk.com/method"
-VK_VERSION = "5.199"
 
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/videos"
 
 HTML = """
-<!doctype html>
-<title>Views Checker</title>
-<h2>Проверка просмотров</h2>
+<h1>Проверка просмотров YouTube</h1>
+
 <form method="post">
-  <input name="url" style="width:400px" placeholder="Вставьте ссылку" required>
-  <button>Проверить</button>
+  <p>Вставьте ссылки — по одной в строке:</p>
+  <textarea name="links" rows="12" cols="90">{{ links or "" }}</textarea><br><br>
+  <button type="submit">Показать просмотры</button>
 </form>
-{% if error %}<p style="color:red">{{ error }}</p>{% endif %}
-{% if views is not none %}<h3>Просмотры: {{ views }}</h3>{% endif %}
+
+{% if rows %}
+<h2>Результат на {{ today }}</h2>
+
+<table border="1" cellpadding="8">
+  <tr>
+    <th>URL</th>
+    <th>Video ID</th>
+    <th>Просмотры</th>
+    <th>Статус</th>
+  </tr>
+  {% for row in rows %}
+  <tr>
+    <td>{{ row.url }}</td>
+    <td>{{ row.video_id }}</td>
+    <td>{{ row.views }}</td>
+    <td>{{ row.status }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<br>
+<form method="post" action="/download_csv">
+  <textarea name="links" style="display:none;">{{ links }}</textarea>
+  <button type="submit">Скачать CSV</button>
+</form>
+{% endif %}
 """
 
-# ---------------- YOUTUBE -----------------
-
 def get_youtube_id(url):
-    # ?v= видео
-    match = re.search(r"v=([^&]+)", url)
-    if match:
-        return match.group(1)
+    patterns = [
+        r"v=([^&]+)",
+        r"youtu\.be/([^?&/]+)",
+        r"shorts/([^?&/]+)",
+        r"embed/([^?&/]+)"
+    ]
 
-    # youtu.be короткая ссылка
-    match = re.search(r"youtu\.be/([^?]+)", url)
-    if match:
-        return match.group(1)
-
-    # shorts
-    match = re.search(r"shorts/([^/?&]+)", url)
-    if match:
-        return match.group(1)
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
 
     return None
-
 
 def get_youtube_views(video_id):
     if not YOUTUBE_API_KEY:
@@ -55,74 +73,77 @@ def get_youtube_views(video_id):
         "key": YOUTUBE_API_KEY
     }
 
-    r = requests.get(YOUTUBE_API_URL, params=params).json()
-
     try:
-        return int(r["items"][0]["statistics"]["viewCount"])
-    except:
+        response = requests.get(YOUTUBE_API_URL, params=params, timeout=10)
+        data = response.json()
+        return int(data["items"][0]["statistics"]["viewCount"])
+    except Exception:
         return None
 
+def process_links(links_text):
+    links = [line.strip() for line in links_text.splitlines() if line.strip()]
+    rows = []
 
-# ---------------- VK -----------------
+    for url in links:
+        video_id = get_youtube_id(url)
 
-def get_vk_post_views(owner_id, post_id):
-    r = requests.get(f"{VK_API}/wall.getById", params={
-        "posts": f"{owner_id}_{post_id}",
-        "access_token": VK_TOKEN,
-        "v": VK_VERSION
-    }).json()
-    try:
-        return r["response"][0]["views"]["count"]
-    except:
-        return None
+        if not video_id:
+            rows.append({
+                "url": url,
+                "video_id": "",
+                "views": "",
+                "status": "Ссылка не распознана"
+            })
+            continue
 
+        views = get_youtube_views(video_id)
 
-def get_vk_video_views(owner_id, video_id):
-    r = requests.get(f"{VK_API}/video.get", params={
-        "videos": f"{owner_id}_{video_id}",
-        "access_token": VK_TOKEN,
-        "v": VK_VERSION
-    }).json()
-    try:
-        return r["response"]["items"][0]["views"]
-    except:
-        return None
+        rows.append({
+            "url": url,
+            "video_id": video_id,
+            "views": views if views is not None else "",
+            "status": "OK" if views is not None else "Не удалось получить просмотры"
+        })
 
-
-# ---------------- ROUTES -----------------
+    return rows
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    views = None
-    error = None
+    rows = []
+    links = ""
 
     if request.method == "POST":
-        url = request.form["url"].strip()
+        links = request.form.get("links", "")
+        rows = process_links(links)
 
-        # YouTube
-        youtube_id = get_youtube_id(url)
-        if youtube_id:
-            views = get_youtube_views(youtube_id)
-            if views is None:
-                error = "Не удалось получить просмотры YouTube"
-            return render_template_string(HTML, views=views, error=error)
+    return render_template_string(
+        HTML,
+        rows=rows,
+        links=links,
+        today=date.today().strftime("%d.%m.%Y")
+    )
 
-        # VK
-        post = re.search(r"wall(-?\d+)_(\d+)", url)
-        video = re.search(r"video(-?\d+)_(\d+)", url)
+@app.route("/download_csv", methods=["POST"])
+def download_csv():
+    links = request.form.get("links", "")
+    rows = process_links(links)
 
-        if post:
-            views = get_vk_post_views(post.group(1), post.group(2))
-        elif video:
-            views = get_vk_video_views(video.group(1), video.group(2))
-        else:
-            error = "Ссылка не распознана"
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=";")
+    writer.writerow(["URL", "Video ID", "Просмотры", "Статус"])
 
-        if views is None and not error:
-            error = "Не удалось получить просмотры"
+    for row in rows:
+        writer.writerow([row["url"], row["video_id"], row["views"], row["status"]])
 
-    return render_template_string(HTML, views=views, error=error)
+    csv_data = output.getvalue().encode("utf-8-sig")
 
+    return Response(
+        csv_data,
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=youtube_views.csv"
+        }
+    )
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0")
